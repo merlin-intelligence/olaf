@@ -1,0 +1,26 @@
+[qdrant]
+url                 = "http://localhost:6333"
+collection          = "chunks"
+concepts_collection = "olaf_concepts"
+
+[qdrant.field_mapping]
+text        = "text"
+doc_id      = "doc_id"
+chunk_index = "chunk_index"
+
+[oxigraph]
+# Local embedded mode (default — no Docker needed):
+path = "./data/ontology"
+
+# Cloud/Docker mode — comment out path and set url instead:
+# url = "http://oxigraph:7878"   # use the Docker service name when running via docker-compose
+# url = "http://localhost:7878"  # or localhost when running oxigraph separately
+
+[ontology]
+base_uri     = "http://olaf.local/ontology#"
+name         = "My Ontology"
+ontology_id  = "main"   # identifiant du named graph actif (urn:olaf:{ontology_id})
+
+[embedding]
+model   = "intfloat/multilingual-e5-small"
+enabled = true

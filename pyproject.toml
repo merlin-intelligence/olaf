@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "olaf"
+version = "0.1.0"
+description = "Ontology Learning Agentic Framework — MCP server for OWL/RDFS ontology construction"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.0.0",
+    "qdrant-client>=1.9.0",
+    "fastembed>=0.3.0",
+    "httpx>=0.27.0",
+    "starlette>=0.40.0",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[project.scripts]
+olaf = "olaf.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/olaf"]
