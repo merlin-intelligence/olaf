@@ -1,0 +1,43 @@
+# olaf_building_agent — example configuration
+# Copy to config.toml and fill in your values.
+
+[olaf]
+# URL of the running OLAF MCP server (SSE endpoint)
+url = "http://localhost:8000/sse"
+
+# Ontology to build (created automatically if it does not exist)
+ontology_id  = "demo"
+ontology_name = "Demo Ontology"
+
+# Namespace for generated URIs — must match the OLAF server config.toml [ontology].base_uri
+base_uri = "http://olaf.local/ontology#"
+
+
+[litellm]
+# Any model supported by LiteLLM — change the string to switch providers:
+#   Anthropic : "claude-sonnet-4-6"  → set ANTHROPIC_API_KEY
+#   OpenAI    : "gpt-4o"             → set OPENAI_API_KEY
+#   Azure     : "azure/gpt-4o"       → set AZURE_API_KEY, AZURE_API_BASE
+#   Ollama    : "ollama/llama3"       → no key needed, set OLLAMA_API_BASE if non-default
+model       = "claude-sonnet-4-6"
+max_tokens  = 4096
+temperature = 0       # 0 = deterministic output, best for structured extraction
+
+
+[agent]
+# Number of chunks to feed to the LLM in a single extraction call.
+# Larger batches = fewer LLM calls but larger prompts. 3–8 is usually a good range.
+batch_size  = 5
+
+# Maximum number of batches to process (0 = no limit, process all pending chunks)
+max_batches = 0
+
+# Run a semantic deduplication pass at the end to detect and merge near-duplicate concepts.
+# Adds ~1 LLM call if duplicates are found.
+consolidate = true
+
+# Output file for the final Turtle export
+export_path = "ontology_output.ttl"
+
+# Log verbosity: DEBUG | INFO | WARNING
+log_level = "INFO"

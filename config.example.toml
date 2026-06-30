@@ -1,0 +1,56 @@
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  OLAF — MCP server configuration                               │
+# │                                                                 │
+# │  This file is for the SERVER only (infrastructure + defaults).  │
+# │  Each agent that connects has its own config with:              │
+# │    - the MCP server URL  (olaf.url)                             │
+# │    - its LLM model + key (litellm.*)                            │
+# │    - which ontology to work on (it calls ontology_switch)       │
+# │                                                                 │
+# │  Agents are fully isolated: each SSE connection gets its own    │
+# │  server instance, so concurrent ontology_switch calls never     │
+# │  interfere with each other.                                     │
+# └─────────────────────────────────────────────────────────────────┘
+
+# ── Qdrant ─────────────────────────────────────────────────────────────────────
+# Connection to the existing chunk collection (read + status tracking).
+# These settings are shared by all connected agents.
+
+[qdrant]
+url                 = "http://localhost:6333"
+collection          = "chunks"          # your existing chunk collection
+concepts_collection = "olaf_concepts"   # prefix — actual: olaf_concepts_{ontology_id}
+
+[qdrant.field_mapping]
+# Names of the payload fields in your existing collection.
+text        = "text"
+doc_id      = "doc_id"
+chunk_index = "chunk_index"
+
+# ── Oxigraph ───────────────────────────────────────────────────────────────────
+# RDF triplestore. All ontologies and seeds are stored here.
+
+[oxigraph]
+# Local mode (default — no extra Docker service needed):
+path = "./data/ontology"
+
+# Docker/remote mode — comment out path and set url instead:
+# url = "http://oxigraph:7878"   # Docker service name (docker-compose)
+# url = "http://localhost:7878"  # or localhost if running separately
+
+# ── Ontology defaults ──────────────────────────────────────────────────────────
+# Default values used when a new connection has not yet called ontology_switch.
+# Each agent can override ontology_id at runtime by calling ontology_switch.
+
+[ontology]
+base_uri     = "http://olaf.local/ontology#"   # namespace for all generated URIs
+name         = "My Ontology"                   # human-readable default name
+ontology_id  = "main"                          # default named graph (urn:olaf:main)
+
+# ── Embedding ──────────────────────────────────────────────────────────────────
+# Powers concept_semantic_search. Model is downloaded once and cached locally.
+# Disable if you don't need semantic dedup (reduces memory usage).
+
+[embedding]
+model   = "intfloat/multilingual-e5-small"   # downloaded automatically via fastembed
+enabled = true
