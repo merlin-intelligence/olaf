@@ -1,7 +1,7 @@
 services:
   oxigraph:
     image: ghcr.io/oxigraph/oxigraph:latest
-    command: --location /data --bind 0.0.0.0:7878
+    command: serve --location /data --bind 0.0.0.0:7878
     ports:
       - "7878:7878"
     volumes:
@@ -18,6 +18,8 @@ services:
       MCP_PORT: "8000"
     volumes:
       - ./config.toml:/app/config.toml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - oxigraph
     restart: unless-stopped

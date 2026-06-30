@@ -78,6 +78,32 @@ class ChunkStore:
             "processed_at": p.get(_PROCESSED_AT_FIELD),
         }
 
+    def get_chunks_batch(self, chunk_ids: list[str]) -> list[dict]:
+        parsed = [self._parse_id(cid) for cid in chunk_ids]
+        results = self.client.retrieve(
+            collection_name=self.collection,
+            ids=parsed,
+            with_payload=True,
+            with_vectors=False,
+        )
+        by_str_id = {str(p.id): p for p in results}
+        output = []
+        for cid in chunk_ids:
+            point = by_str_id.get(cid)
+            if point is None:
+                output.append({"id": cid, "error": "not found"})
+            else:
+                p = point.payload or {}
+                text = p.get(self.fm.text, "")
+                output.append({
+                    "id": str(point.id),
+                    "doc_id": p.get(self.fm.doc_id, ""),
+                    "chunk_index": p.get(self.fm.chunk_index, 0),
+                    "text": text,
+                    "status": p.get(_STATUS_FIELD, "pending"),
+                })
+        return output
+
     def mark_processed(self, chunk_id: str) -> bool:
         try:
             self.client.set_payload(

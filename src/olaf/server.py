@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import sys
+from contextlib import asynccontextmanager
 from typing import Any
 
 import mcp.types as types
@@ -25,16 +26,34 @@ def _err(msg: str) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=f"Error: {msg}")]
 
 
-def create_server(config: Config) -> Server:
-    server = Server("olaf")
-    onto = OntologyStore(
-        url=config.oxigraph.url,
-        base_uri=config.ontology.base_uri,
-        name=config.ontology.name,
-        ontology_id=config.ontology.ontology_id,
-    )
+async def _make_shared_infra(config: Config) -> tuple[OntologyStore, QdrantClient, ChunkStore]:
+    """Create and bootstrap infrastructure objects shared across all SSE connections."""
+    onto = OntologyStore(url=config.oxigraph.url)
+    await onto.bootstrap(config.ontology.ontology_id, config.ontology.base_uri, config.ontology.name)
     qdrant = QdrantClient(url=config.qdrant.url)
     chunks = ChunkStore(config.qdrant.url, config.qdrant.collection, config.qdrant.field_mapping)
+    return onto, qdrant, chunks
+
+
+def create_server(
+    config: Config,
+    onto: OntologyStore,
+    qdrant: QdrantClient,
+    chunks: ChunkStore,
+) -> Server:
+    """
+    Create an MCP server instance.
+
+    For SSE deployments, pass pre-created shared onto/qdrant/chunks so a single
+    OntologyStore (stateless) and QdrantClient serve all connections.
+    For stdio, create them first with _make_shared_infra and pass them in.
+    """
+    # Per-session state: only the active ontology context.
+    # Using a dict so the call_tool closure can mutate it without `nonlocal`.
+    session: dict[str, str] = {
+        "ontology_id": config.ontology.ontology_id,
+        "base_uri": config.ontology.base_uri,
+    }
 
     embed: EmbeddingService | None = None
     if config.embedding.enabled:
@@ -43,6 +62,8 @@ def create_server(config: Config) -> Server:
             embed = EmbeddingService(config.embedding.model, qdrant, concepts_collection)
         except Exception as e:
             print(f"Warning: embeddings disabled ({e})", file=sys.stderr)
+
+    server = Server("olaf")
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
@@ -80,6 +101,25 @@ def create_server(config: Config) -> Server:
                 },
             ),
             types.Tool(
+                name="chunk_read_batch",
+                description=(
+                    "Read the full text of multiple chunks in a single call. "
+                    "More efficient than calling chunk_read repeatedly. "
+                    "Returns a list of {id, doc_id, chunk_index, text, status} objects."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "chunk_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of Qdrant point IDs to retrieve",
+                        },
+                    },
+                    "required": ["chunk_ids"],
+                },
+            ),
+            types.Tool(
                 name="chunk_mark_processed",
                 description="Mark a chunk as processed after extracting ontology elements from it.",
                 inputSchema={
@@ -88,6 +128,28 @@ def create_server(config: Config) -> Server:
                         "chunk_id": {"type": "string"},
                     },
                     "required": ["chunk_id"],
+                },
+            ),
+            types.Tool(
+                name="concept_list",
+                description=(
+                    "List all OWL classes in the active ontology. "
+                    "Returns uri, label, definition, and parent_uri for each class. "
+                    "Use root_only=true to get only top-level classes (no parent). "
+                    "Useful for surveying the current ontology state before adding concepts."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "root_only": {
+                            "type": "boolean",
+                            "description": "Return only root classes (no rdfs:subClassOf parent). Default: false.",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max results (default: 100)",
+                        },
+                    },
                 },
             ),
             types.Tool(
@@ -171,6 +233,31 @@ def create_server(config: Config) -> Server:
                         "language": {"type": "string"},
                     },
                     "required": ["uri"],
+                },
+            ),
+            types.Tool(
+                name="individual_create",
+                description=(
+                    "Create an owl:NamedIndividual — a specific named entity that is an instance of a class. "
+                    "Use for unique, identifiable real-world entities (e.g. 'GDPR', 'Paris Agreement'). "
+                    "Always call concept_search first to confirm the class exists. "
+                    "Returns {uri, created} — created=false if the individual already exists."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string", "description": "Human-readable name, e.g. 'Paris Agreement'"},
+                        "class_uri": {"type": "string", "description": "URI of the owl:Class this individual is an instance of"},
+                        "definition": {"type": "string", "description": "Description of this specific individual"},
+                        "aliases": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Alternative labels (rdfs:altLabel)",
+                        },
+                        "language": {"type": "string", "description": "BCP-47 language tag (default: en)"},
+                        "source_chunk_id": {"type": "string", "description": "Qdrant point ID of the source chunk"},
+                    },
+                    "required": ["label", "class_uri"],
                 },
             ),
             types.Tool(
@@ -304,13 +391,13 @@ def create_server(config: Config) -> Server:
                 name="seed_load",
                 description=(
                     "Load a seed ontology (Turtle format) into the global seed store. "
-                    "Pass either 'url' (HTTP URI) or 'content' (raw Turtle string). "
+                    "Pass either 'url' (HTTP/HTTPS URI) or 'content' (raw Turtle string). "
                     "Seeds are shared across all ontologies."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "url": {"type": "string", "description": "HTTP URI of a Turtle ontology to fetch"},
+                        "url": {"type": "string", "description": "HTTP/HTTPS URI of a Turtle ontology to fetch"},
                         "content": {"type": "string", "description": "Raw Turtle content to load directly"},
                         "graph_id": {
                             "type": "string",
@@ -383,6 +470,7 @@ def create_server(config: Config) -> Server:
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         try:
+            oid = session["ontology_id"]
             match name:
                 case "chunk_list":
                     return _text(chunks.list_chunks(
@@ -396,13 +484,24 @@ def create_server(config: Config) -> Server:
                     chunk = chunks.get_chunk(arguments["chunk_id"])
                     return _text(chunk) if chunk else _err(f"Chunk not found: {arguments['chunk_id']}")
 
+                case "chunk_read_batch":
+                    return _text(chunks.get_chunks_batch(arguments["chunk_ids"]))
+
                 case "chunk_mark_processed":
                     ok = chunks.mark_processed(arguments["chunk_id"])
                     return _text("ok" if ok else "failed")
 
+                case "concept_list":
+                    return _text(await onto.concept_list(
+                        oid,
+                        root_only=arguments.get("root_only", False),
+                        limit=arguments.get("limit", 100),
+                    ))
+
                 case "concept_create":
                     source_chunk_id = arguments.get("source_chunk_id")
-                    result = onto.concept_create(
+                    result = await onto.concept_create(
+                        oid,
                         label=arguments["label"],
                         definition=arguments["definition"],
                         parent_uri=arguments.get("parent_uri"),
@@ -415,11 +514,11 @@ def create_server(config: Config) -> Server:
                     return _text(result)
 
                 case "concept_get":
-                    result = onto.concept_get(arguments["uri"])
+                    result = await onto.concept_get(oid, arguments["uri"])
                     return _text(result) if result else _err(f"Concept not found: {arguments['uri']}")
 
                 case "concept_search":
-                    return _text(onto.concept_search_sparql(arguments["query"], arguments.get("top_k", 10)))
+                    return _text(await onto.concept_search_sparql(oid, arguments["query"], arguments.get("top_k", 10)))
 
                 case "concept_semantic_search":
                     if not embed:
@@ -427,7 +526,8 @@ def create_server(config: Config) -> Server:
                     return _text(embed.search_concepts(arguments["query"], arguments.get("top_k", 10)))
 
                 case "concept_update":
-                    onto.concept_update(
+                    await onto.concept_update(
+                        oid,
                         uri=arguments["uri"],
                         label=arguments.get("label"),
                         definition=arguments.get("definition"),
@@ -436,22 +536,46 @@ def create_server(config: Config) -> Server:
                         lang=arguments.get("language", "en"),
                     )
                     if embed and (arguments.get("label") or arguments.get("definition")):
-                        concept = onto.concept_get(arguments["uri"])
-                        if concept:
-                            label = concept.get("label", "")
-                            definition = concept.get("definition", "")
-                            if label:
-                                embed.upsert_concept(arguments["uri"], label, definition)
+                        concept = await onto.concept_get(oid, arguments["uri"])
+                        if concept and concept.get("label"):
+                            embed.upsert_concept(
+                                arguments["uri"],
+                                concept["label"],
+                                concept.get("definition", ""),
+                            )
                     return _text("ok")
 
+                case "individual_create":
+                    source_chunk_id = arguments.get("source_chunk_id")
+                    result = await onto.individual_create(
+                        oid,
+                        label=arguments["label"],
+                        class_uri=arguments["class_uri"],
+                        definition=arguments.get("definition"),
+                        aliases=arguments.get("aliases"),
+                        lang=arguments.get("language", "en"),
+                        source_chunk_id=source_chunk_id,
+                    )
+                    if result["created"] and embed:
+                        embed.upsert_concept(result["uri"], arguments["label"], arguments.get("definition", ""), source_chunk_id)
+                    return _text(result)
+
                 case "concept_merge":
-                    onto.concept_merge(arguments["keep_uri"], arguments["merge_uri"])
+                    await onto.concept_merge(oid, arguments["keep_uri"], arguments["merge_uri"])
                     if embed:
                         embed.delete_concept(arguments["merge_uri"])
+                        concept = await onto.concept_get(oid, arguments["keep_uri"])
+                        if concept and concept.get("label"):
+                            embed.upsert_concept(
+                                arguments["keep_uri"],
+                                concept["label"],
+                                concept.get("definition", ""),
+                            )
                     return _text("ok")
 
                 case "property_create":
-                    return _text(onto.property_create(
+                    return _text(await onto.property_create(
+                        oid,
                         label=arguments["label"],
                         prop_type=arguments["type"],
                         domain_uri=arguments.get("domain_uri"),
@@ -461,14 +585,15 @@ def create_server(config: Config) -> Server:
                     ))
 
                 case "property_get":
-                    result = onto.property_get(arguments["uri"])
+                    result = await onto.property_get(oid, arguments["uri"])
                     return _text(result) if result else _err(f"Property not found: {arguments['uri']}")
 
                 case "property_search":
-                    return _text(onto.property_search(arguments["query"], arguments.get("top_k", 10)))
+                    return _text(await onto.property_search(oid, arguments["query"], arguments.get("top_k", 10)))
 
                 case "relation_add":
-                    onto.relation_add(
+                    await onto.relation_add(
+                        oid,
                         subject_uri=arguments["subject_uri"],
                         property_uri=arguments["property_uri"],
                         object_value=arguments["object_value"],
@@ -478,7 +603,8 @@ def create_server(config: Config) -> Server:
                     return _text("ok")
 
                 case "relation_search":
-                    return _text(onto.relation_search(
+                    return _text(await onto.relation_search(
+                        oid,
                         subject_uri=arguments.get("subject_uri"),
                         property_uri=arguments.get("property_uri"),
                         object_uri=arguments.get("object_uri"),
@@ -486,7 +612,8 @@ def create_server(config: Config) -> Server:
                     ))
 
                 case "restriction_add":
-                    bnode = onto.restriction_add(
+                    bnode = await onto.restriction_add(
+                        oid,
                         class_uri=arguments["class_uri"],
                         property_uri=arguments["property_uri"],
                         restriction_type=arguments["restriction_type"],
@@ -497,42 +624,45 @@ def create_server(config: Config) -> Server:
                     return _text({"restriction_bnode": bnode})
 
                 case "seed_list":
-                    return _text(onto.seed_list())
+                    return _text(await onto.seed_list())
 
                 case "seed_load":
-                    return _text(onto.seed_load(
+                    return _text(await onto.seed_load(
                         graph_id=arguments.get("graph_id"),
                         url=arguments.get("url"),
                         content=arguments.get("content"),
                     ))
 
                 case "ontology_list":
-                    return _text(onto.ontology_list())
+                    return _text(await onto.ontology_list(oid))
 
                 case "ontology_create":
-                    return _text(onto.ontology_create(
+                    base_uri = arguments.get("base_uri") or session["base_uri"]
+                    return _text(await onto.ontology_create(
                         ontology_id=arguments["ontology_id"],
                         name=arguments["name"],
-                        base_uri=arguments.get("base_uri"),
+                        base_uri=base_uri,
                     ))
 
                 case "ontology_switch":
-                    result = onto.ontology_switch(arguments["ontology_id"])
+                    result = await onto.ontology_switch(arguments["ontology_id"])
+                    session["ontology_id"] = result["active_id"]
+                    session["base_uri"] = result["base_uri"]
                     if embed:
-                        embed.switch_collection(f"{config.qdrant.concepts_collection}_{arguments['ontology_id']}")
+                        embed.switch_collection(f"{config.qdrant.concepts_collection}_{result['active_id']}")
                     return _text(result)
 
                 case "ontology_summary":
-                    summary = onto.summary()
+                    summary = await onto.summary(oid)
                     try:
                         summary["chunks_total"] = chunks.count_total()
                         summary["chunks_processed"] = chunks.count_processed()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        summary["chunks_warning"] = f"Qdrant unavailable: {e}"
                     return _text(summary)
 
                 case "ontology_export":
-                    return _text(onto.export_ttl(include_seeds=arguments.get("include_seeds", False)))
+                    return _text(await onto.export_ttl(oid, include_seeds=arguments.get("include_seeds", False)))
 
                 case _:
                     return _err(f"Unknown tool: {name}")
@@ -543,63 +673,77 @@ def create_server(config: Config) -> Server:
     return server
 
 
-def _make_sse_app(server: Server):
+def _make_sse_app(config: Config):
     from mcp.server.sse import SseServerTransport
     from starlette.applications import Starlette
     from starlette.routing import Mount, Route
 
+    onto = OntologyStore(url=config.oxigraph.url)
+    qdrant = QdrantClient(url=config.qdrant.url)
+    chunks = ChunkStore(config.qdrant.url, config.qdrant.collection, config.qdrant.field_mapping)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        await onto.bootstrap(config.ontology.ontology_id, config.ontology.base_uri, config.ontology.name)
+        yield
+
     transport = SseServerTransport("/messages/")
 
     async def handle_sse(request):
+        server = create_server(config, onto=onto, qdrant=qdrant, chunks=chunks)
         async with transport.connect_sse(
             request.scope, request.receive, request._send
         ) as streams:
             await server.run(streams[0], streams[1], server.create_initialization_options())
 
-    return Starlette(routes=[
-        Route("/sse", endpoint=handle_sse),
-        Mount("/messages/", app=transport.handle_post_message),
-    ])
+    return Starlette(
+        lifespan=lifespan,
+        routes=[
+            Route("/sse", endpoint=handle_sse),
+            Mount("/messages/", app=transport.handle_post_message),
+        ],
+    )
 
 
 async def _run() -> None:
     config = Config.load()
-    server = create_server(config)
-
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
 
     if transport == "sse":
         import uvicorn
         host = os.environ.get("MCP_HOST", "0.0.0.0")
         port = int(os.environ.get("MCP_PORT", "8000"))
-        app = _make_sse_app(server)
+        app = _make_sse_app(config)
         uv_config = uvicorn.Config(app, host=host, port=port, log_level="info")
         uv_server = uvicorn.Server(uv_config)
         await uv_server.serve()
     else:
+        onto, qdrant, chunks = await _make_shared_infra(config)
+        server = create_server(config, onto, qdrant, chunks)
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-def _make_onto(config: Config) -> OntologyStore:
-    return OntologyStore(
-        url=config.oxigraph.url,
-        base_uri=config.ontology.base_uri,
-        name=config.ontology.name,
-        ontology_id=config.ontology.ontology_id,
-    )
+async def _make_onto(config: Config) -> OntologyStore:
+    onto = OntologyStore(url=config.oxigraph.url)
+    await onto.bootstrap(config.ontology.ontology_id, config.ontology.base_uri, config.ontology.name)
+    return onto
 
 
 def _cmd_drop(ontology_id: str) -> None:
-    onto = _make_onto(Config.load())
-    result = onto.drop_ontology(ontology_id)
-    print(f"Ontologie '{result['dropped']}' supprimée.")
+    async def _inner():
+        onto = await _make_onto(Config.load())
+        result = await onto.drop_ontology(ontology_id)
+        print(f"Ontologie '{result['dropped']}' supprimée.")
+    asyncio.run(_inner())
 
 
 def _cmd_drop_seed(seed_id: str) -> None:
-    onto = _make_onto(Config.load())
-    result = onto.seed_drop(seed_id)
-    print(f"Seed '{result['dropped']}' supprimée.")
+    async def _inner():
+        onto = await _make_onto(Config.load())
+        result = await onto.seed_drop(seed_id)
+        print(f"Seed '{result['dropped']}' supprimée.")
+    asyncio.run(_inner())
 
 
 def main() -> None:

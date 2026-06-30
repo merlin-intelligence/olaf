@@ -1,9 +1,13 @@
 from __future__ import annotations
-import sys
+from typing import Any
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointIdsList, PointStruct, VectorParams
 import uuid
+
+# Shared across all EmbeddingService instances in the same process.
+# fastembed model loading (~500 MB download + model init) happens once.
+_model_cache: dict[str, Any] = {}
 
 _VECTOR_SIZE: dict[str, int] = {
     "BAAI/bge-small-en-v1.5": 384,
@@ -23,28 +27,30 @@ class EmbeddingService:
         self.model_name = model_name
         self.client = client
         self.collection = collection
-        self._model = None
+        self._known_collections: set[str] = set()
         self._ensure_collection()
 
     def _model_instance(self):
-        if self._model is None:
+        if self.model_name not in _model_cache:
             from fastembed import TextEmbedding
-            self._model = TextEmbedding(self.model_name)
-        return self._model
+            _model_cache[self.model_name] = TextEmbedding(self.model_name)
+        return _model_cache[self.model_name]
 
     def _vector_size(self) -> int:
         if self.model_name in _VECTOR_SIZE:
             return _VECTOR_SIZE[self.model_name]
-        # Unknown model: embed a probe string to determine size
         return len(self._embed("probe"))
 
     def _ensure_collection(self) -> None:
+        if self.collection in self._known_collections:
+            return
         existing = {c.name for c in self.client.get_collections().collections}
         if self.collection not in existing:
             self.client.create_collection(
                 self.collection,
                 vectors_config=VectorParams(size=self._vector_size(), distance=Distance.COSINE),
             )
+        self._known_collections.add(self.collection)
 
     def switch_collection(self, collection_name: str) -> None:
         self.collection = collection_name
