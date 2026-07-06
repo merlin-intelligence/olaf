@@ -108,6 +108,7 @@ enabled = true
 | `ontology_switch` | Switch the active ontology for this session. All subsequent tools operate on the selected ontology. |
 | `ontology_summary` | Counts of classes, properties, individuals, restrictions, root classes, and chunk processing progress. Includes `active_ontology`. |
 | `ontology_export` | Export the active ontology as Turtle. Pass `include_seeds=true` to append all seed graphs. |
+| `ontology_orphans` | List classes/individuals with no relation to the rest of the graph beyond their own type/label/definition triples. |
 
 ### Chunks
 
@@ -133,6 +134,7 @@ enabled = true
 | Tool | Description |
 |------|-------------|
 | `property_create` | Create a property. `type` = `"object"` (links two classes) or `"datatype"` (class → literal). Generates a lowerCamelCase URI. |
+| `property_update` | Update `domain_uri`, `range_uri`, or `parent_uri` after creation. Pass `""` to clear a field, omit to leave unchanged. |
 | `property_get` | Get all triples for a property. |
 | `property_search` | Substring search on property labels. |
 
@@ -140,7 +142,8 @@ enabled = true
 
 | Tool | Description |
 |------|-------------|
-| `relation_add` | Insert any triple `(subject, property, object)`. Use full URIs. Set `is_literal=true` for literal objects; optionally pass `datatype` (XSD URI). |
+| `relation_add` | Insert any triple `(subject, property, object)`. Use full URIs. Set `is_literal=true` for literal objects; optionally pass `datatype` (XSD URI). Rejects subject/property/object URIs that look like they belong to this ontology but don't exist yet. |
+| `relation_delete` | Remove a triple `(subject, property, object)`. Same parameters as `relation_add`. |
 | `relation_search` | Find triples by pattern. All three parameters are optional. |
 | `restriction_add` | Add an `owl:Restriction` blank node to a class. Supports `some`, `all`, `has_value`, `exactly`, `min`, `max`. |
 
@@ -195,7 +198,8 @@ For each chunk:
 9. concept_create / property_create / relation_add / restriction_add
 10. chunk_mark_processed(chunk_id)
 
-11. ontology_export()
+11. ontology_orphans()               → connect or justify any isolated entity
+12. ontology_export()
 ```
 
 ---

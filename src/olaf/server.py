@@ -241,6 +241,10 @@ def create_server(
                     "Create an owl:NamedIndividual — a specific named entity that is an instance of a class. "
                     "Use for unique, identifiable real-world entities (e.g. 'GDPR', 'Paris Agreement'). "
                     "Always call concept_search first to confirm the class exists. "
+                    "Only one class_uri per call — to also type the individual as an instance of a "
+                    "second class (multiple inheritance, e.g. both 'Developing Country' and 'Small Island "
+                    "Developing State'), call relation_add afterwards with property_uri = "
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type and object_value = the extra class URI. "
                     "Returns {uri, created} — created=false if the individual already exists."
                 ),
                 inputSchema={
@@ -298,6 +302,23 @@ def create_server(
                 },
             ),
             types.Tool(
+                name="property_update",
+                description=(
+                    "Update a property's domain, range, or parent property after creation. "
+                    "Pass an empty string to clear a field, or omit it to leave it unchanged."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "uri": {"type": "string"},
+                        "domain_uri": {"type": "string", "description": "rdfs:domain class URI"},
+                        "range_uri": {"type": "string", "description": "rdfs:range class/datatype URI"},
+                        "parent_uri": {"type": "string", "description": "rdfs:subPropertyOf URI"},
+                    },
+                    "required": ["uri"],
+                },
+            ),
+            types.Tool(
                 name="property_get",
                 description="Get all details of a property by URI.",
                 inputSchema={
@@ -322,9 +343,34 @@ def create_server(
                 name="relation_add",
                 description=(
                     "Add a triple (subject, property, object) to the ontology. "
-                    "Use full URIs for all arguments. "
+                    "Use full URIs for all arguments — never type a URI from memory: get subject/object "
+                    "URIs from concept_create/individual_create/concept_search/concept_get output, and get "
+                    "property_uri from property_create/property_search output (or a well-known vocab term). "
+                    "Fails with an error if subject_uri, property_uri, or object_value (as a URI) look like "
+                    "they belong to this ontology but don't exist yet — create the entity first. "
                     "Common property URIs: rdfs:subClassOf = http://www.w3.org/2000/01/rdf-schema#subClassOf, "
                     "rdf:type = http://www.w3.org/1999/02/22-rdf-syntax-ns#type."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "subject_uri": {"type": "string"},
+                        "property_uri": {"type": "string"},
+                        "object_value": {"type": "string", "description": "Target URI or literal value"},
+                        "is_literal": {"type": "boolean", "description": "True if object_value is a literal (default: false)"},
+                        "datatype": {
+                            "type": "string",
+                            "description": "XSD datatype URI when is_literal=true, e.g. http://www.w3.org/2001/XMLSchema#integer",
+                        },
+                    },
+                    "required": ["subject_uri", "property_uri", "object_value"],
+                },
+            ),
+            types.Tool(
+                name="relation_delete",
+                description=(
+                    "Remove a triple (subject, property, object) from the ontology. "
+                    "Use to correct a wrong relation, e.g. before re-adding it with property_update-style edits."
                 ),
                 inputSchema={
                     "type": "object",
@@ -465,6 +511,20 @@ def create_server(
                     },
                 },
             ),
+            types.Tool(
+                name="ontology_orphans",
+                description=(
+                    "Find classes and individuals with no relation to the rest of the ontology "
+                    "(nothing beyond their own type/label/definition triples). "
+                    "Call before finishing a session and connect or justify every isolated entity."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "Max results (default: 100)"},
+                    },
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -584,6 +644,16 @@ def create_server(
                         lang=arguments.get("language", "en"),
                     ))
 
+                case "property_update":
+                    await onto.property_update(
+                        oid,
+                        uri=arguments["uri"],
+                        domain_uri=arguments.get("domain_uri"),
+                        range_uri=arguments.get("range_uri"),
+                        parent_uri=arguments.get("parent_uri"),
+                    )
+                    return _text("ok")
+
                 case "property_get":
                     result = await onto.property_get(oid, arguments["uri"])
                     return _text(result) if result else _err(f"Property not found: {arguments['uri']}")
@@ -593,6 +663,17 @@ def create_server(
 
                 case "relation_add":
                     await onto.relation_add(
+                        oid,
+                        subject_uri=arguments["subject_uri"],
+                        property_uri=arguments["property_uri"],
+                        object_value=arguments["object_value"],
+                        is_literal=arguments.get("is_literal", False),
+                        datatype=arguments.get("datatype"),
+                    )
+                    return _text("ok")
+
+                case "relation_delete":
+                    await onto.relation_delete(
                         oid,
                         subject_uri=arguments["subject_uri"],
                         property_uri=arguments["property_uri"],
@@ -663,6 +744,9 @@ def create_server(
 
                 case "ontology_export":
                     return _text(await onto.export_ttl(oid, include_seeds=arguments.get("include_seeds", False)))
+
+                case "ontology_orphans":
+                    return _text(await onto.orphans(oid, limit=arguments.get("limit", 100)))
 
                 case _:
                     return _err(f"Unknown tool: {name}")

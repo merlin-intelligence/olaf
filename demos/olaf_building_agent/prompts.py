@@ -31,18 +31,29 @@ from a collection of text chunks stored in Qdrant, using the OLAF MCP tools avai
    - **Object properties** via `property_create` — for meaningful relations between classes.
      Examples: "manages", "isPartOf", "hasBeneficiary", "fundsProject".
      Use `domain_uri` and `range_uri` to type each property.
-   - **Subclass relations** via `relation_create` — when one class is a specialisation of another.
+   - **Subclass relations** via `relation_add` — when one class is a specialisation of another.
      Example: "Green Bond" rdfs:subClassOf "Financial Instrument".
    A flat list of concepts with no relations is not a valid ontology. Every run must produce properties.
+   - Never encode the same pair of entities both ways: if "Green Bond" is already
+     `rdfs:subClassOf` "Financial Instrument", do not also add an object property like
+     "implements" or "isTypeOf" between them (and vice versa). Pick one relation per pair.
 
 6. **Before creating anything — always deduplicate**
    - Call `concept_search` (label substring match) or/and `concept_semantic_search` (vector similarity)
      before every `concept_create`. If a match exists, reuse or extend it instead.
    - Call `property_search` before every `property_create`.
+   - Never type a URI from memory in `relation_add`. Always copy the exact `uri` returned by
+     `concept_create`/`individual_create`/`property_create`, or found via `concept_search`/
+     `concept_get`/`property_search`. `relation_add` will reject guessed URIs that don't
+     already exist in the ontology.
+   - To fix a mistake, use `relation_delete` to remove a wrong triple, `property_update` to
+     change a property's domain/range/parent, or `concept_update` to change a label/definition —
+     don't just add a corrected triple on top of the wrong one.
 
 7. **Ontology content rules**
-   - **Concepts** (`owl:Class`): generic, high-level, reusable across documents.
+   - **Concepts** (`owl:Class`): generic, representative, reusable across documents.
      Examples: "Contract", "Party", "Obligation", "Document". Avoid overly specific classes.
+     But represent the maximum number of concepts in the source text if there are relevant.
    - **Individuals** (`owl:NamedIndividual`): specific named entities with a unique identity.
      Examples: "GDPR", "Paris Agreement". Use `individual_create` with the URI of the
      owl:Class this entity is an instance of.
@@ -50,7 +61,13 @@ from a collection of text chunks stored in Qdrant, using the OLAF MCP tools avai
    - Labels must be space-separated words in title case: "Climate Risk", "Investment Fund", "Legal Entity".
      Never use camelCase, snake_case, or run-together words as labels — the server generates the URI automatically.
 
-8. **Finish**
+8. **Check for isolated entities**
+   - Call `ontology_orphans` to list classes/individuals with no relation to the rest of the graph.
+   - For each one, either connect it (a `parent_uri`, a `property_create`+`relation_add`, or an
+     `owl:equivalentClass`/`rdfs:subClassOf` to a seed concept) or, if it genuinely has no
+     relation in the source text, note it in your final report instead of leaving it unexplained.
+
+9. **Finish**
    - Call `ontology_export` to produce the final Turtle.
    - Report how many concepts, individuals, and properties were created.
 
