@@ -567,6 +567,50 @@ class OntologyStore:
         """)
         return {"uri": uri, "created": True}
 
+    async def property_update(
+        self,
+        ontology_id: str,
+        uri: str,
+        domain_uri: str | None = None,
+        range_uri: str | None = None,
+        parent_uri: str | None = None,
+    ) -> None:
+        _check_uri(uri)
+        graph = self._graph(ontology_id)
+        if domain_uri is not None:
+            await self._ex.execute_update(f"""
+            {_PREFIXES}
+            DELETE {{ GRAPH <{graph}> {{ <{uri}> rdfs:domain ?o }} }}
+            WHERE  {{ GRAPH <{graph}> {{ <{uri}> rdfs:domain ?o }} }}
+            """)
+            if domain_uri:
+                await self._ex.execute_update(f"""
+                {_PREFIXES}
+                INSERT DATA {{ GRAPH <{graph}> {{ <{uri}> rdfs:domain <{_check_uri(domain_uri)}> }} }}
+                """)
+        if range_uri is not None:
+            await self._ex.execute_update(f"""
+            {_PREFIXES}
+            DELETE {{ GRAPH <{graph}> {{ <{uri}> rdfs:range ?o }} }}
+            WHERE  {{ GRAPH <{graph}> {{ <{uri}> rdfs:range ?o }} }}
+            """)
+            if range_uri:
+                await self._ex.execute_update(f"""
+                {_PREFIXES}
+                INSERT DATA {{ GRAPH <{graph}> {{ <{uri}> rdfs:range <{_check_uri(range_uri)}> }} }}
+                """)
+        if parent_uri is not None:
+            await self._ex.execute_update(f"""
+            {_PREFIXES}
+            DELETE {{ GRAPH <{graph}> {{ <{uri}> rdfs:subPropertyOf ?o }} }}
+            WHERE  {{ GRAPH <{graph}> {{ <{uri}> rdfs:subPropertyOf ?o }} }}
+            """)
+            if parent_uri:
+                await self._ex.execute_update(f"""
+                {_PREFIXES}
+                INSERT DATA {{ GRAPH <{graph}> {{ <{uri}> rdfs:subPropertyOf <{_check_uri(parent_uri)}> }} }}
+                """)
+
     async def property_get(self, ontology_id: str, uri: str) -> dict | None:
         _check_uri(uri)
         rows = await self._ex.execute_select(f"""
@@ -605,7 +649,53 @@ class OntologyStore:
 
     # ── Relations ─────────────────────────────────────────────────────────
 
+    async def _require_existing(self, graph: str, base: str, uri: str) -> None:
+        """Reject URIs under our own base namespace that don't correspond to any existing
+        entity — catches hand-typed/mis-slugified URIs before they create a silent duplicate
+        or a dangling reference. External URIs (seeds, well-known vocab) are not checked."""
+        if not uri.startswith(base):
+            return
+        exists = await self._ex.execute_ask(f"""
+        {_PREFIXES}
+        ASK {{ GRAPH <{graph}> {{ {{ <{uri}> ?p ?o }} UNION {{ ?s ?p2 <{uri}> }} }} }}
+        """)
+        if not exists:
+            raise ValueError(
+                f"URI not found in this ontology: {uri!r}. If this entity doesn't exist yet, "
+                "create it first with concept_create/individual_create/property_create. "
+                "If it should already exist, use concept_search/concept_get/property_search "
+                "to find its exact URI instead of guessing it."
+            )
+
     async def relation_add(
+        self,
+        ontology_id: str,
+        subject_uri: str,
+        property_uri: str,
+        object_value: str,
+        is_literal: bool = False,
+        datatype: str | None = None,
+    ) -> None:
+        _check_uri(subject_uri)
+        _check_uri(property_uri)
+        graph = self._graph(ontology_id)
+        base = await self._resolve_base(ontology_id)
+        await self._require_existing(graph, base, subject_uri)
+        await self._require_existing(graph, base, property_uri)
+        if is_literal:
+            obj = f'"{_esc(object_value)}"^^<{_check_uri(datatype)}>' if datatype else f'"{_esc(object_value)}"'
+        else:
+            _check_uri(object_value)
+            await self._require_existing(graph, base, object_value)
+            obj = f"<{object_value}>"
+        await self._ex.execute_update(f"""
+        {_PREFIXES}
+        INSERT DATA {{
+            GRAPH <{graph}> {{ <{subject_uri}> <{property_uri}> {obj} }}
+        }}
+        """)
+
+    async def relation_delete(
         self,
         ontology_id: str,
         subject_uri: str,
@@ -622,7 +712,7 @@ class OntologyStore:
             obj = f"<{_check_uri(object_value)}>"
         await self._ex.execute_update(f"""
         {_PREFIXES}
-        INSERT DATA {{
+        DELETE DATA {{
             GRAPH <{self._graph(ontology_id)}> {{ <{subject_uri}> <{property_uri}> {obj} }}
         }}
         """)
@@ -734,6 +824,35 @@ class OntologyStore:
             WHERE {{}}
             """)
         return bnode
+
+    # ── Validation ────────────────────────────────────────────────────────
+
+    async def orphans(self, ontology_id: str, limit: int = 100) -> list[dict]:
+        """Classes/individuals with no relation to the rest of the graph beyond their own
+        rdf:type/label/altLabel/definition/extractedFrom bookkeeping triples."""
+        graph = self._graph(ontology_id)
+        rows = await self._ex.execute_select(f"""
+        {_PREFIXES}
+        SELECT ?e (SAMPLE(?lbl) AS ?label) (SAMPLE(?knd) AS ?kind) WHERE {{
+            GRAPH <{graph}> {{
+                {{ ?e a owl:Class . BIND("class" AS ?knd) }}
+                UNION
+                {{ ?e a owl:NamedIndividual . BIND("individual" AS ?knd) }}
+                OPTIONAL {{ ?e rdfs:label ?lbl }}
+                FILTER NOT EXISTS {{
+                    ?e ?p ?o .
+                    FILTER(?p NOT IN (rdf:type, rdfs:label, rdfs:altLabel, skos:definition, <urn:olaf:extractedFrom>))
+                }}
+                FILTER NOT EXISTS {{ ?s ?p2 ?e }}
+            }}
+        }}
+        GROUP BY ?e
+        LIMIT {limit}
+        """, ["e", "label", "kind"])
+        return [
+            {"uri": row["e"] or "", "label": row["label"] or "", "kind": row["kind"] or ""}
+            for row in rows
+        ]
 
     # ── Seeds ─────────────────────────────────────────────────────────────
 
