@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,6 +15,7 @@ class FieldMapping:
 @dataclass
 class QdrantConfig:
     url: str = "http://localhost:6333"
+    api_key: str | None = None
     collection: str = "chunks"
     concepts_collection: str = "olaf_concepts"
     field_mapping: FieldMapping = field(default_factory=FieldMapping)
@@ -55,6 +57,7 @@ class Config:
 
         cfg = cls()
         if path is None or not Path(path).exists():
+            cfg.qdrant.api_key = os.environ.get("QDRANT_API_KEY", cfg.qdrant.api_key)
             return cfg
 
         with open(path, "rb") as f:
@@ -62,6 +65,7 @@ class Config:
 
         if q := data.get("qdrant"):
             cfg.qdrant.url = q.get("url", cfg.qdrant.url)
+            cfg.qdrant.api_key = q.get("api_key", cfg.qdrant.api_key)
             cfg.qdrant.collection = q.get("collection", cfg.qdrant.collection)
             cfg.qdrant.concepts_collection = q.get("concepts_collection", cfg.qdrant.concepts_collection)
             if fm := q.get("field_mapping"):
@@ -80,5 +84,7 @@ class Config:
         if e := data.get("embedding"):
             cfg.embedding.model = e.get("model", cfg.embedding.model)
             cfg.embedding.enabled = e.get("enabled", cfg.embedding.enabled)
+
+        cfg.qdrant.api_key = os.environ.get("QDRANT_API_KEY", cfg.qdrant.api_key)
 
         return cfg
