@@ -18,6 +18,8 @@
 
 [qdrant]
 url                 = "http://localhost:6333"
+# api_key             = "..."           # required if Qdrant has auth enabled
+                                         # (or set the QDRANT_API_KEY env var, which takes precedence)
 collection          = "chunks"          # your existing chunk collection
 concepts_collection = "olaf_concepts"   # prefix — actual: olaf_concepts_{ontology_id}
 

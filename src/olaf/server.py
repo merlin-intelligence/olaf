@@ -30,8 +30,8 @@ async def _make_shared_infra(config: Config) -> tuple[OntologyStore, QdrantClien
     """Create and bootstrap infrastructure objects shared across all SSE connections."""
     onto = OntologyStore(url=config.oxigraph.url)
     await onto.bootstrap(config.ontology.ontology_id, config.ontology.base_uri, config.ontology.name)
-    qdrant = QdrantClient(url=config.qdrant.url)
-    chunks = ChunkStore(config.qdrant.url, config.qdrant.collection, config.qdrant.field_mapping)
+    qdrant = QdrantClient(url=config.qdrant.url, api_key=config.qdrant.api_key)
+    chunks = ChunkStore(config.qdrant.url, config.qdrant.collection, config.qdrant.field_mapping, config.qdrant.api_key)
     return onto, qdrant, chunks
 
 
@@ -763,8 +763,8 @@ def _make_sse_app(config: Config):
     from starlette.routing import Mount, Route
 
     onto = OntologyStore(url=config.oxigraph.url)
-    qdrant = QdrantClient(url=config.qdrant.url)
-    chunks = ChunkStore(config.qdrant.url, config.qdrant.collection, config.qdrant.field_mapping)
+    qdrant = QdrantClient(url=config.qdrant.url, api_key=config.qdrant.api_key)
+    chunks = ChunkStore(config.qdrant.url, config.qdrant.collection, config.qdrant.field_mapping, config.qdrant.api_key)
 
     @asynccontextmanager
     async def lifespan(app):

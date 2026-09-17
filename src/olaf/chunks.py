@@ -11,8 +11,8 @@ _PROCESSED_AT_FIELD = "olaf_processed_at"
 
 
 class ChunkStore:
-    def __init__(self, url: str, collection: str, field_mapping: FieldMapping):
-        self.client = QdrantClient(url=url)
+    def __init__(self, url: str, collection: str, field_mapping: FieldMapping, api_key: str | None = None):
+        self.client = QdrantClient(url=url, api_key=api_key)
         self.collection = collection
         self.fm = field_mapping
 
