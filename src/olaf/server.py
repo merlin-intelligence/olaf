@@ -157,7 +157,10 @@ def create_server(
                 description=(
                     "Create an OWL class in the ontology. "
                     "Always call concept_search and concept_semantic_search first to check for duplicates. "
-                    "Returns the URI and whether a new class was created (created=false if URI already exists)."
+                    "Returns the URI and whether a new class was created (created=false if URI already exists). "
+                    "If the concept already exists and source_chunk_id is given, it is added to the concept's "
+                    "existing sources (no duplicate is created) — always pass source_chunk_id even when you "
+                    "expect created=false, so provenance stays complete across chunks."
                 ),
                 inputSchema={
                     "type": "object",
@@ -178,7 +181,10 @@ def create_server(
             ),
             types.Tool(
                 name="concept_get",
-                description="Get all triples for a concept URI: type, label, definition, aliases, subClassOf, restrictions.",
+                description=(
+                    "Get all triples for a concept URI: type, label, definition, aliases, subClassOf, restrictions. "
+                    "Also returns source_chunk_ids: every chunk this concept was extracted from."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -192,7 +198,8 @@ def create_server(
                 description=(
                     "Search for existing concepts by label substring (SPARQL). "
                     "Call this before concept_create to avoid duplicates. "
-                    "For broader similarity matching, also call concept_semantic_search."
+                    "For broader similarity matching, also call concept_semantic_search. "
+                    "Each result includes source_chunk_ids: every chunk that concept was extracted from."
                 ),
                 inputSchema={
                     "type": "object",
@@ -245,7 +252,9 @@ def create_server(
                     "second class (multiple inheritance, e.g. both 'Developing Country' and 'Small Island "
                     "Developing State'), call relation_add afterwards with property_uri = "
                     "http://www.w3.org/1999/02/22-rdf-syntax-ns#type and object_value = the extra class URI. "
-                    "Returns {uri, created} — created=false if the individual already exists."
+                    "Returns {uri, created} — created=false if the individual already exists. "
+                    "If it already exists and source_chunk_id is given, it is added to the individual's "
+                    "existing sources — always pass source_chunk_id even when you expect created=false."
                 ),
                 inputSchema={
                     "type": "object",
@@ -281,7 +290,11 @@ def create_server(
             ),
             types.Tool(
                 name="property_create",
-                description="Create an OWL property (ObjectProperty links two classes; DatatypeProperty links a class to a literal).",
+                description=(
+                    "Create an OWL property (ObjectProperty links two classes; DatatypeProperty links a class "
+                    "to a literal). If it already exists and source_chunk_id is given, it is added to the "
+                    "property's existing sources — always pass source_chunk_id even when you expect created=false."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -297,6 +310,7 @@ def create_server(
                         },
                         "parent_uri": {"type": "string", "description": "rdfs:subPropertyOf URI"},
                         "language": {"type": "string"},
+                        "source_chunk_id": {"type": "string", "description": "Qdrant point ID of the chunk this property was extracted from"},
                     },
                     "required": ["label", "type"],
                 },
@@ -320,7 +334,7 @@ def create_server(
             ),
             types.Tool(
                 name="property_get",
-                description="Get all details of a property by URI.",
+                description="Get all details of a property by URI, including source_chunk_ids (every chunk it was extracted from).",
                 inputSchema={
                     "type": "object",
                     "properties": {"uri": {"type": "string"}},
@@ -329,7 +343,7 @@ def create_server(
             ),
             types.Tool(
                 name="property_search",
-                description="Search for properties by label substring.",
+                description="Search for properties by label substring. Each result includes source_chunk_ids.",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -349,8 +363,30 @@ def create_server(
                     "Fails with an error if subject_uri, property_uri, or object_value (as a URI) look like "
                     "they belong to this ontology but don't exist yet — create the entity first. "
                     "Common property URIs: rdfs:subClassOf = http://www.w3.org/2000/01/rdf-schema#subClassOf, "
-                    "rdf:type = http://www.w3.org/1999/02/22-rdf-syntax-ns#type."
+                    "rdf:type = http://www.w3.org/1999/02/22-rdf-syntax-ns#type. "
+                    "Pass source_chunk_id to record which chunk this relation was extracted from — if the "
+                    "same triple is added again from a different chunk, the new chunk id is added to its "
+                    "existing sources instead of being lost (adding the same triple is otherwise a no-op)."
                 ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "subject_uri": {"type": "string"},
+                        "property_uri": {"type": "string"},
+                        "object_value": {"type": "string", "description": "Target URI or literal value"},
+                        "is_literal": {"type": "boolean", "description": "True if object_value is a literal (default: false)"},
+                        "datatype": {
+                            "type": "string",
+                            "description": "XSD datatype URI when is_literal=true, e.g. http://www.w3.org/2001/XMLSchema#integer",
+                        },
+                        "source_chunk_id": {"type": "string", "description": "Qdrant point ID of the chunk this relation was extracted from"},
+                    },
+                    "required": ["subject_uri", "property_uri", "object_value"],
+                },
+            ),
+            types.Tool(
+                name="relation_sources",
+                description="Get the chunk IDs a specific (subject, property, object) triple was extracted from.",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -642,6 +678,7 @@ def create_server(
                         range_uri=arguments.get("range_uri"),
                         parent_uri=arguments.get("parent_uri"),
                         lang=arguments.get("language", "en"),
+                        source_chunk_id=arguments.get("source_chunk_id"),
                     ))
 
                 case "property_update":
@@ -669,8 +706,19 @@ def create_server(
                         object_value=arguments["object_value"],
                         is_literal=arguments.get("is_literal", False),
                         datatype=arguments.get("datatype"),
+                        source_chunk_id=arguments.get("source_chunk_id"),
                     )
                     return _text("ok")
+
+                case "relation_sources":
+                    return _text(await onto.relation_sources(
+                        oid,
+                        subject_uri=arguments["subject_uri"],
+                        property_uri=arguments["property_uri"],
+                        object_value=arguments["object_value"],
+                        is_literal=arguments.get("is_literal", False),
+                        datatype=arguments.get("datatype"),
+                    ))
 
                 case "relation_delete":
                     await onto.relation_delete(

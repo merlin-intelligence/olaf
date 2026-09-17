@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import hashlib
 import re
 import uuid
 from urllib.parse import urlparse
@@ -66,6 +67,20 @@ def _chunk_uri(chunk_id: str) -> str:
 
 def _chunk_id_from_uri(uri: str) -> str:
     return uri[len(_CHUNK_URI_PREFIX):] if uri.startswith(_CHUNK_URI_PREFIX) else uri
+
+
+def _split_chunks(concatenated: str | None) -> list[str]:
+    if not concatenated:
+        return []
+    return [_chunk_id_from_uri(c) for c in concatenated.split("|") if c]
+
+
+def _stmt_uri(subject_uri: str, property_uri: str, obj_term: str) -> str:
+    """Deterministic URI identifying a (subject, property, object) triple, so its
+    provenance (extractedFrom) can be looked up or extended without needing to
+    round-trip a blank node identity across separate HTTP requests."""
+    key = f"{subject_uri}\n{property_uri}\n{obj_term}"
+    return f"urn:olaf:stmt:{hashlib.sha256(key.encode()).hexdigest()[:16]}"
 
 
 # ── HTTP executor ──────────────────────────────────────────────────────────────
@@ -165,6 +180,17 @@ class OntologyStore:
 
     async def _uri(self, local: str, ontology_id: str) -> str:
         return f"{await self._resolve_base(ontology_id)}#{local}"
+
+    async def _add_source_chunk(self, graph: str, uri: str, chunk_id: str) -> None:
+        """Record that `uri` was (also) extracted from `chunk_id`. Adding the same
+        chunk twice is a no-op — RDF triples are a set — so callers don't need to
+        check for existence first."""
+        await self._ex.execute_update(f"""
+        {_PREFIXES}
+        INSERT DATA {{
+            GRAPH <{graph}> {{ <{uri}> <urn:olaf:extractedFrom> <{_chunk_uri(chunk_id)}> }}
+        }}
+        """)
 
     # ── Startup ────────────────────────────────────────────────────────────
 
@@ -299,6 +325,8 @@ class OntologyStore:
         uri = await self._uri(_slugify_class(label), ontology_id)
         # Guard against any pre-existing entity (class or individual) at this URI.
         if await self._ex.execute_ask(f"{_PREFIXES}\nASK {{ GRAPH <{graph}> {{ <{uri}> ?p ?o }} }}"):
+            if source_chunk_id is not None:
+                await self._add_source_chunk(graph, uri, source_chunk_id)
             return {"uri": uri, "created": False}
 
         lines = [
@@ -348,24 +376,30 @@ class OntologyStore:
 
     async def concept_search_sparql(self, ontology_id: str, query_str: str, top_k: int = 10) -> list[dict]:
         q = _esc(query_str.lower())
+        graph = self._graph(ontology_id)
         rows = await self._ex.execute_select(f"""
         {_PREFIXES}
-        SELECT DISTINCT ?c ?label ?definition ?chunk WHERE {{
-            GRAPH <{self._graph(ontology_id)}> {{
+        SELECT ?c ?label ?definition ?chunks WHERE {{
+            GRAPH <{graph}> {{
                 ?c a owl:Class ; rdfs:label ?label .
                 OPTIONAL {{ ?c skos:definition ?definition }}
-                OPTIONAL {{ ?c <urn:olaf:extractedFrom> ?chunk }}
                 FILTER(CONTAINS(LCASE(STR(?label)), "{q}"))
+            }}
+            OPTIONAL {{
+                SELECT ?c (GROUP_CONCAT(DISTINCT STR(?chunk); separator="|") AS ?chunks) WHERE {{
+                    GRAPH <{graph}> {{ ?c <urn:olaf:extractedFrom> ?chunk }}
+                }}
+                GROUP BY ?c
             }}
         }}
         LIMIT {top_k}
-        """, ["c", "label", "definition", "chunk"])
+        """, ["c", "label", "definition", "chunks"])
         return [
             {
                 "uri": row["c"] or "",
                 "label": row["label"] or "",
                 "definition": row["definition"] or "",
-                "source_chunk_id": _chunk_id_from_uri(row["chunk"]) if row["chunk"] else None,
+                "source_chunk_ids": _split_chunks(row["chunks"]),
                 "match_type": "sparql",
             }
             for row in rows
@@ -454,10 +488,11 @@ class OntologyStore:
                     FILTER(?anyParent != owl:Thing)
                 }"""
 
+        graph = self._graph(ontology_id)
         rows = await self._ex.execute_select(f"""
         {_PREFIXES}
-        SELECT ?c (SAMPLE(?lbl) AS ?label) (SAMPLE(?def) AS ?definition) (SAMPLE(?par) AS ?parent) WHERE {{
-            GRAPH <{self._graph(ontology_id)}> {{
+        SELECT ?c (SAMPLE(?lbl) AS ?label) (SAMPLE(?def) AS ?definition) (SAMPLE(?par) AS ?parent) (SAMPLE(?chunks) AS ?chunksSample) WHERE {{
+            GRAPH <{graph}> {{
                 ?c a owl:Class .
                 OPTIONAL {{ ?c rdfs:label ?lbl }}
                 OPTIONAL {{ ?c skos:definition ?def }}
@@ -468,10 +503,16 @@ class OntologyStore:
                 }}
                 {root_filter}
             }}
+            OPTIONAL {{
+                SELECT ?c (GROUP_CONCAT(DISTINCT STR(?chunk); separator="|") AS ?chunks) WHERE {{
+                    GRAPH <{graph}> {{ ?c <urn:olaf:extractedFrom> ?chunk }}
+                }}
+                GROUP BY ?c
+            }}
         }}
         GROUP BY ?c
         LIMIT {limit}
-        """, ["c", "label", "definition", "parent"])
+        """, ["c", "label", "definition", "parent", "chunksSample"])
 
         return [
             {
@@ -479,6 +520,7 @@ class OntologyStore:
                 "label": row["label"] or "",
                 "definition": row["definition"] or "",
                 "parent_uri": row["parent"],
+                "source_chunk_ids": _split_chunks(row["chunksSample"]),
             }
             for row in rows
         ]
@@ -503,6 +545,8 @@ class OntologyStore:
         if await self._ex.execute_ask(
             f"{_PREFIXES}\nASK {{ GRAPH <{graph}> {{ <{uri}> ?p ?o }} }}"
         ):
+            if source_chunk_id is not None:
+                await self._add_source_chunk(graph, uri, source_chunk_id)
             return {"uri": uri, "created": False}
 
         lines = [
@@ -538,12 +582,15 @@ class OntologyStore:
         range_uri: str | None = None,
         parent_uri: str | None = None,
         lang: str = "en",
+        source_chunk_id: str | None = None,
     ) -> dict:
         graph = self._graph(ontology_id)
         uri = await self._uri(_slugify_prop(label), ontology_id)
         owl_type = "owl:ObjectProperty" if prop_type == "object" else "owl:DatatypeProperty"
 
         if await self._ex.execute_ask(f"{_PREFIXES}\nASK {{ GRAPH <{graph}> {{ <{uri}> a {owl_type} }} }}"):
+            if source_chunk_id is not None:
+                await self._add_source_chunk(graph, uri, source_chunk_id)
             return {"uri": uri, "created": False}
 
         lines = [
@@ -556,6 +603,8 @@ class OntologyStore:
             lines.append(f"<{uri}> rdfs:range <{_check_uri(range_uri)}>")
         if parent_uri:
             lines.append(f"<{uri}> rdfs:subPropertyOf <{_check_uri(parent_uri)}>")
+        if source_chunk_id is not None:
+            lines.append(f"<{uri}> <urn:olaf:extractedFrom> <{_chunk_uri(source_chunk_id)}>")
 
         await self._ex.execute_update(f"""
         {_PREFIXES}
@@ -619,14 +668,19 @@ class OntologyStore:
         """, ["p", "o"])
         if not rows:
             return None
-        return {"uri": uri, "triples": [{"predicate": row["p"] or "", "object": row["o"] or ""} for row in rows]}
+        triples = [{"predicate": row["p"] or "", "object": row["o"] or ""} for row in rows]
+        source_chunk_ids = [
+            _chunk_id_from_uri(t["object"]) for t in triples if t["predicate"] == "urn:olaf:extractedFrom"
+        ]
+        return {"uri": uri, "triples": triples, "source_chunk_ids": source_chunk_ids}
 
     async def property_search(self, ontology_id: str, query_str: str, top_k: int = 10) -> list[dict]:
         q = _esc(query_str.lower())
+        graph = self._graph(ontology_id)
         rows = await self._ex.execute_select(f"""
         {_PREFIXES}
-        SELECT DISTINCT ?p ?label ?type WHERE {{
-            GRAPH <{self._graph(ontology_id)}> {{
+        SELECT DISTINCT ?p ?label ?type ?chunks WHERE {{
+            GRAPH <{graph}> {{
                 ?p rdfs:label ?label .
                 {{
                     ?p a owl:ObjectProperty .
@@ -639,11 +693,22 @@ class OntologyStore:
                 }}
                 FILTER(CONTAINS(LCASE(STR(?label)), "{q}"))
             }}
+            OPTIONAL {{
+                SELECT ?p (GROUP_CONCAT(DISTINCT STR(?chunk); separator="|") AS ?chunks) WHERE {{
+                    GRAPH <{graph}> {{ ?p <urn:olaf:extractedFrom> ?chunk }}
+                }}
+                GROUP BY ?p
+            }}
         }}
         LIMIT {top_k}
-        """, ["p", "label", "type"])
+        """, ["p", "label", "type", "chunks"])
         return [
-            {"uri": row["p"] or "", "label": row["label"] or "", "type": row["type"] or ""}
+            {
+                "uri": row["p"] or "",
+                "label": row["label"] or "",
+                "type": row["type"] or "",
+                "source_chunk_ids": _split_chunks(row["chunks"]),
+            }
             for row in rows
         ]
 
@@ -667,6 +732,32 @@ class OntologyStore:
                 "to find its exact URI instead of guessing it."
             )
 
+    @staticmethod
+    def _format_object(object_value: str, is_literal: bool, datatype: str | None) -> str:
+        if is_literal:
+            return f'"{_esc(object_value)}"^^<{_check_uri(datatype)}>' if datatype else f'"{_esc(object_value)}"'
+        return f"<{_check_uri(object_value)}>"
+
+    async def _add_relation_source(
+        self, graph: str, subject_uri: str, property_uri: str, obj_term: str, chunk_id: str
+    ) -> None:
+        """Record that the (subject, property, object) triple was (also) extracted from
+        `chunk_id`, via a deterministic reification URI. Adding the same chunk twice is a
+        no-op — RDF triples are a set — so callers don't need to check for existence first."""
+        stmt = _stmt_uri(subject_uri, property_uri, obj_term)
+        await self._ex.execute_update(f"""
+        {_PREFIXES}
+        INSERT DATA {{
+            GRAPH <{graph}> {{
+                <{stmt}> a rdf:Statement ;
+                         rdf:subject <{subject_uri}> ;
+                         rdf:predicate <{property_uri}> ;
+                         rdf:object {obj_term} ;
+                         <urn:olaf:extractedFrom> <{_chunk_uri(chunk_id)}> .
+            }}
+        }}
+        """)
+
     async def relation_add(
         self,
         ontology_id: str,
@@ -675,6 +766,7 @@ class OntologyStore:
         object_value: str,
         is_literal: bool = False,
         datatype: str | None = None,
+        source_chunk_id: str | None = None,
     ) -> None:
         _check_uri(subject_uri)
         _check_uri(property_uri)
@@ -682,18 +774,18 @@ class OntologyStore:
         base = await self._resolve_base(ontology_id)
         await self._require_existing(graph, base, subject_uri)
         await self._require_existing(graph, base, property_uri)
-        if is_literal:
-            obj = f'"{_esc(object_value)}"^^<{_check_uri(datatype)}>' if datatype else f'"{_esc(object_value)}"'
-        else:
+        if not is_literal:
             _check_uri(object_value)
             await self._require_existing(graph, base, object_value)
-            obj = f"<{object_value}>"
+        obj = self._format_object(object_value, is_literal, datatype)
         await self._ex.execute_update(f"""
         {_PREFIXES}
         INSERT DATA {{
             GRAPH <{graph}> {{ <{subject_uri}> <{property_uri}> {obj} }}
         }}
         """)
+        if source_chunk_id is not None:
+            await self._add_relation_source(graph, subject_uri, property_uri, obj, source_chunk_id)
 
     async def relation_delete(
         self,
@@ -706,16 +798,45 @@ class OntologyStore:
     ) -> None:
         _check_uri(subject_uri)
         _check_uri(property_uri)
-        if is_literal:
-            obj = f'"{_esc(object_value)}"^^<{_check_uri(datatype)}>' if datatype else f'"{_esc(object_value)}"'
-        else:
-            obj = f"<{_check_uri(object_value)}>"
+        graph = self._graph(ontology_id)
+        obj = self._format_object(object_value, is_literal, datatype)
         await self._ex.execute_update(f"""
         {_PREFIXES}
         DELETE DATA {{
-            GRAPH <{self._graph(ontology_id)}> {{ <{subject_uri}> <{property_uri}> {obj} }}
+            GRAPH <{graph}> {{ <{subject_uri}> <{property_uri}> {obj} }}
         }}
         """)
+        # Drop the reified provenance record for this triple, if any.
+        stmt = _stmt_uri(subject_uri, property_uri, obj)
+        await self._ex.execute_update(f"""
+        {_PREFIXES}
+        DELETE WHERE {{
+            GRAPH <{graph}> {{ <{stmt}> ?p ?o }}
+        }}
+        """)
+
+    async def relation_sources(
+        self,
+        ontology_id: str,
+        subject_uri: str,
+        property_uri: str,
+        object_value: str,
+        is_literal: bool = False,
+        datatype: str | None = None,
+    ) -> list[str]:
+        """Chunk IDs this (subject, property, object) triple was extracted from."""
+        _check_uri(subject_uri)
+        _check_uri(property_uri)
+        graph = self._graph(ontology_id)
+        obj = self._format_object(object_value, is_literal, datatype)
+        stmt = _stmt_uri(subject_uri, property_uri, obj)
+        rows = await self._ex.execute_select(f"""
+        {_PREFIXES}
+        SELECT ?chunk WHERE {{
+            GRAPH <{graph}> {{ <{stmt}> <urn:olaf:extractedFrom> ?chunk }}
+        }}
+        """, ["chunk"])
+        return [_chunk_id_from_uri(row["chunk"]) for row in rows if row["chunk"]]
 
     async def relation_search(
         self,
