@@ -35,7 +35,7 @@ class OntologyConfig:
 
 @dataclass
 class EmbeddingConfig:
-    model: str = "intfloat/multilingual-e5-base"
+    model: str = "intfloat/multilingual-e5-small"
     enabled: bool = True
 
 
