@@ -37,6 +37,12 @@ from a collection of text chunks stored in Qdrant, using the OLAF MCP tools avai
    - Never encode the same pair of entities both ways: if "Green Bond" is already
      `rdfs:subClassOf` "Financial Instrument", do not also add an object property like
      "implements" or "isTypeOf" between them (and vice versa). Pick one relation per pair.
+   - **Always pass `source_chunk_id`** (the id of the chunk currently being processed) to
+     `concept_create`, `individual_create`, `property_create`, and `relation_add` — including
+     when you already expect a match (`created=false`). The server accumulates chunk ids on
+     the existing entity/relation instead of discarding them, so this is how the ontology stays
+     traceable back to every chunk that supports it, even when the same concept or relation
+     is re-derived from several chunks across a run.
 
 6. **Before creating anything — always deduplicate**
    - Call `concept_search` (label substring match) or/and `concept_semantic_search` (vector similarity)
