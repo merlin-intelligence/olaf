@@ -313,11 +313,12 @@ class OntologyStore:
         if source_chunk_id is not None:
             lines.append(f"<{uri}> <urn:olaf:extractedFrom> <{_chunk_uri(source_chunk_id)}>")
 
+        joined_lines = " .\n                ".join(lines)
         await self._ex.execute_update(f"""
         {_PREFIXES}
         INSERT DATA {{
             GRAPH <{graph}> {{
-                {" .\n                ".join(lines)} .
+                {joined_lines} .
             }}
         }}
         """)
@@ -517,11 +518,12 @@ class OntologyStore:
         if source_chunk_id is not None:
             lines.append(f"<{uri}> <urn:olaf:extractedFrom> <{_chunk_uri(source_chunk_id)}>")
 
+        joined_lines = " .\n                ".join(lines)
         await self._ex.execute_update(f"""
         {_PREFIXES}
         INSERT DATA {{
             GRAPH <{graph}> {{
-                {" .\n                ".join(lines)} .
+                {joined_lines} .
             }}
         }}
         """)
@@ -557,11 +559,12 @@ class OntologyStore:
         if parent_uri:
             lines.append(f"<{uri}> rdfs:subPropertyOf <{_check_uri(parent_uri)}>")
 
+        joined_lines = " .\n                ".join(lines)
         await self._ex.execute_update(f"""
         {_PREFIXES}
         INSERT DATA {{
             GRAPH <{graph}> {{
-                {" .\n                ".join(lines)} .
+                {joined_lines} .
             }}
         }}
         """)

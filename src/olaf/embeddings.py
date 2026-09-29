@@ -32,8 +32,15 @@ class EmbeddingService:
 
     def _model_instance(self):
         if self.model_name not in _model_cache:
-            from fastembed import TextEmbedding
-            _model_cache[self.model_name] = TextEmbedding(self.model_name)
+            try:
+                from fastembed import TextEmbedding
+                _model_cache[self.model_name] = ("fastembed", TextEmbedding(self.model_name))
+            except Exception:
+                try:
+                    from sentence_transformers import SentenceTransformer
+                    _model_cache[self.model_name] = ("sentence_transformers", SentenceTransformer(self.model_name))
+                except Exception as e:
+                    raise RuntimeError(f"Could not load embedding model {self.model_name}: {e}") from e
         return _model_cache[self.model_name]
 
     def _vector_size(self) -> int:
@@ -56,8 +63,12 @@ class EmbeddingService:
         self.collection = collection_name
         self._ensure_collection()
 
-    def _embed(self, text: str) -> list[float]:
-        return list(next(iter(self._model_instance().embed([text]))).tolist())
+    def _embed(self, text: str, is_query: bool = False) -> list[float]:
+        kind, model = self._model_instance()
+        if kind == "fastembed":
+            return list(next(iter(model.embed([text]))).tolist())
+        prefix = ("query: " if is_query else "passage: ") if "e5" in self.model_name.lower() else ""
+        return model.encode(f"{prefix}{text}").tolist()
 
     def _concept_point_id(self, uri: str) -> str:
         return str(uuid.uuid5(uuid.NAMESPACE_URL, uri))
@@ -70,7 +81,7 @@ class EmbeddingService:
         source_chunk_id: str | None = None,
     ) -> None:
         text = f"{label}. {definition}" if definition else label
-        vector = self._embed(text)
+        vector = self._embed(text, is_query=False)
         payload: dict = {"uri": uri, "label": label, "definition": definition}
         if source_chunk_id is not None:
             payload["source_chunk_id"] = source_chunk_id
@@ -80,20 +91,29 @@ class EmbeddingService:
         )
 
     def search_concepts(self, query: str, top_k: int = 10) -> list[dict]:
-        vector = self._embed(query)
-        hits = self.client.search(
-            collection_name=self.collection,
-            query_vector=vector,
-            limit=top_k,
-            with_payload=True,
-        )
+        vector = self._embed(query, is_query=True)
+        if hasattr(self.client, "query_points"):
+            response = self.client.query_points(
+                collection_name=self.collection,
+                query=vector,
+                limit=top_k,
+                with_payload=True,
+            )
+            hits = response.points
+        else:
+            hits = self.client.search(
+                collection_name=self.collection,
+                query_vector=vector,
+                limit=top_k,
+                with_payload=True,
+            )
         return [
             {
-                "uri": h.payload.get("uri", ""),
-                "label": h.payload.get("label", ""),
-                "definition": h.payload.get("definition", ""),
-                "source_chunk_id": h.payload.get("source_chunk_id"),
-                "score": round(h.score, 4),
+                "uri": h.payload.get("uri", "") if h.payload else "",
+                "label": h.payload.get("label", "") if h.payload else "",
+                "definition": h.payload.get("definition", "") if h.payload else "",
+                "source_chunk_id": h.payload.get("source_chunk_id") if h.payload else None,
+                "score": round(h.score, 4) if hasattr(h, "score") and h.score is not None else 0.0,
                 "match_type": "semantic",
             }
             for h in hits
