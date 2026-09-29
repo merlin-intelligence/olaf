@@ -43,14 +43,19 @@ class ChunkStore:
         offset: int | None = None,
     ) -> list[dict]:
         must: list = []
+        must_not: list = []
         if doc_id:
             must.append(FieldCondition(key=self.fm.doc_id, match=MatchValue(value=doc_id)))
         if status and status != "all":
-            must.append(FieldCondition(key=_STATUS_FIELD, match=MatchValue(value=status)))
+            if status == "pending":
+                must_not.append(FieldCondition(key=_STATUS_FIELD, match=MatchValue(value="processed")))
+            else:
+                must.append(FieldCondition(key=_STATUS_FIELD, match=MatchValue(value=status)))
 
+        scroll_filter = Filter(must=must if must else None, must_not=must_not if must_not else None)
         points, _ = self.client.scroll(
             collection_name=self.collection,
-            scroll_filter=Filter(must=must) if must else None,
+            scroll_filter=scroll_filter if (must or must_not) else None,
             limit=limit,
             offset=offset,
             with_payload=True,
