@@ -1,6 +1,6 @@
 # OLAF
 
-**Ontology Learning Agentic Framework** — MCP server for building OWL/RDFS ontologies from text, incrementally and collaboratively with an LLM.
+**Ontology Learning Agentic Framework** — MCP server for building OWL/RDFS ontologies from text, incrementally and collaboratively with an LLM, and for querying them.
 
 ---
 
@@ -8,12 +8,14 @@
 
 OLAF exposes a set of MCP tools that let an LLM agent construct a formal OWL/RDFS ontology from raw text chunks. The agent reads chunks, extracts concepts and relations, checks for duplicates, and builds up the ontology piece by piece — resuming at any point without losing work.
 
+Once built, the ontology can be queried the same way: read-only tools and `sparql_query` let an agent answer natural-language questions and trace each fact back to its source chunks. See [`demos/`](demos/) for a building agent and a searching agent.
+
 ```
 Text chunks (Qdrant)  ──►  LLM agent  ──►  OWL ontology (Oxigraph)
                               │  ▲
                      seed TTLs│  │ concept_search / concept_semantic_search
                               ▼  │
-                          22 MCP tools
+                          30 MCP tools
 ```
 
 **Storage split:**
@@ -116,17 +118,20 @@ enabled = true
 |------|-------------|
 | `chunk_list` | List chunks from Qdrant. Filter by `doc_id` and/or `status` (`pending`/`processed`/`all`). Returns `id`, `doc_id`, `chunk_index`, `text_preview` (200 chars), `status`. |
 | `chunk_read` | Read the full text of a chunk by its Qdrant point ID. |
+| `chunk_read_batch` | Read the full text of several chunks in one call. Returns `{id, doc_id, chunk_index, text, status}` for each. |
 | `chunk_mark_processed` | Mark a chunk as processed after extracting ontology elements from it. |
 
-### Concepts (`owl:Class`)
+### Concepts (`owl:Class`) and individuals
 
 | Tool | Description |
 |------|-------------|
+| `concept_list` | List the classes of the active ontology with `uri`, `label`, `definition` and `parent_uri`. `root_only=true` returns only top-level classes. |
 | `concept_search` | Substring search on `rdfs:label` and `rdfs:altLabel` via SPARQL. Returns `source_chunk_id` when available. Call before `concept_create`. |
 | `concept_semantic_search` | Vector similarity search in the active ontology's Qdrant collection. Finds near-duplicates even with different wording. Returns `source_chunk_id` when available. Call alongside `concept_search`. |
 | `concept_create` | Create an `owl:Class`. Generates a CamelCase URI from the label. Optional `source_chunk_id` to record which chunk the concept was extracted from. Returns `{uri, created}` — `created=false` if the URI already exists. |
 | `concept_get` | Get all triples for a concept: type, label, definition, aliases, `subClassOf`, restrictions, `source_chunk_ids`. |
 | `concept_update` | Update label, definition, or aliases (`aliases_add` / `aliases_remove`). |
+| `individual_create` | Create an `owl:NamedIndividual` (a specific named entity such as "GDPR") as an instance of `class_uri`. Returns `{uri, created}`. If it already exists, `source_chunk_id` is added to its sources. |
 | `concept_merge` | Merge two concepts: all triples from `merge_uri` move to `keep_uri`, all references re-pointed, `merge_uri` deleted. |
 
 ### Properties (`owl:ObjectProperty` / `owl:DatatypeProperty`)
@@ -145,6 +150,7 @@ enabled = true
 | `relation_add` | Insert any triple `(subject, property, object)`. Use full URIs. Set `is_literal=true` for literal objects; optionally pass `datatype` (XSD URI). Rejects subject/property/object URIs that look like they belong to this ontology but don't exist yet. |
 | `relation_delete` | Remove a triple `(subject, property, object)`. Same parameters as `relation_add`. |
 | `relation_search` | Find triples by pattern. All three parameters are optional. |
+| `relation_sources` | Get the chunk IDs a `(subject, property, object)` triple was extracted from. |
 | `restriction_add` | Add an `owl:Restriction` blank node to a class. Supports `some`, `all`, `has_value`, `exactly`, `min`, `max`. |
 
 `restriction_add` produces:
@@ -155,6 +161,12 @@ enabled = true
     owl:someValuesFrom :Engine
 ] .
 ```
+
+### Querying
+
+| Tool | Description |
+|------|-------------|
+| `sparql_query` | Run a read-only SPARQL query (`SELECT` / `ASK` / `CONSTRUCT` / `DESCRIBE`; updates are rejected). No implicit default graph: target `GRAPH <urn:olaf:{id}>` or `urn:olaf:seed:*`. Optional `limit` (default 100, max 1000) for SELECT rows. |
 
 ### Seeds
 
@@ -200,6 +212,19 @@ For each chunk:
 
 11. ontology_orphans()               → connect or justify any isolated entity
 12. ontology_export()
+```
+
+### Querying workflow
+
+Used by [`olaf_searching_agent`](demos/olaf_searching_agent/), with read-only tools only:
+
+```
+1. ontology_switch("my-project")
+2. concept_search(term) +            → locate the entities named in the question
+   concept_semantic_search(term)
+3. concept_get / relation_search     → explore their neighbourhood
+4. sparql_query(query)               → lists, counts, joins, hierarchies, paths
+5. chunk_read_batch(source_chunk_ids) → ground the answer in the source text
 ```
 
 ---

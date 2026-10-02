@@ -23,3 +23,5 @@ wheels/
 htmlcov/
 config.toml
 .env
+venv/
+.venv/
