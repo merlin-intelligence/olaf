@@ -33,12 +33,9 @@ chunk_index = "chunk_index"
 # RDF triplestore. All ontologies and seeds are stored here.
 
 [oxigraph]
-# Local mode (default — no extra Docker service needed):
-path = "./data/ontology"
-
-# Docker/remote mode — comment out path and set url instead:
+# HTTP endpoint of the Oxigraph server (embedded/local file mode is not supported).
+url = "http://localhost:7878"    # Oxigraph running on this machine
 # url = "http://oxigraph:7878"   # Docker service name (docker-compose)
-# url = "http://localhost:7878"  # or localhost if running separately
 
 # ── Ontology defaults ──────────────────────────────────────────────────────────
 # Default values used when a new connection has not yet called ontology_switch.

@@ -55,6 +55,22 @@ def _check_uri(uri: str) -> str:
     return uri
 
 
+_READ_QUERY_FORMS = {"SELECT", "ASK", "CONSTRUCT", "DESCRIBE"}
+
+# One prologue item: a comment line, a PREFIX or a BASE declaration.
+_PROLOGUE_ITEM = re.compile(r"\s*(?:#[^\n]*(?:\n|$)|PREFIX\s+[^\s:]*:\s*<[^>]*>|BASE\s+<[^>]*>)", re.IGNORECASE)
+_FIRST_KEYWORD = re.compile(r"\s*([A-Za-z]+)")
+
+
+def _query_form(sparql: str) -> str | None:
+    """Return the query form keyword (SELECT, ASK, INSERT…) after skipping the prologue."""
+    pos = 0
+    while (m := _PROLOGUE_ITEM.match(sparql, pos)) and m.end() > pos:
+        pos = m.end()
+    m = _FIRST_KEYWORD.match(sparql, pos)
+    return m.group(1).upper() if m else None
+
+
 def _fmt_http(binding: dict | None) -> str | None:
     if binding is None:
         return None
@@ -110,6 +126,19 @@ class _HttpExecutor:
         )
         resp.raise_for_status()
         return bool(resp.json().get("boolean", False))
+
+    async def execute_raw_query(self, sparql: str, accept: str):
+        """Run an arbitrary read query and return the raw HTTP response.
+        Oxigraph's error message is surfaced (instead of a bare status code) so a
+        caller writing the query — typically an LLM — can fix it and retry."""
+        resp = await self._client.post(
+            f"{self._url}/query",
+            content=sparql.encode(),
+            headers={"Content-Type": "application/sparql-query", "Accept": accept},
+        )
+        if resp.is_error:
+            raise ValueError(f"SPARQL error ({resp.status_code}): {resp.text.strip()}")
+        return resp
 
     async def execute_update(self, sparql: str) -> None:
         resp = await self._client.post(
@@ -1016,6 +1045,38 @@ class OntologyStore:
         count = int(rows[0]["n"]) if rows and rows[0]["n"] is not None else 0
         source = url or "(inline content)"
         return {"graph_id": graph_id, "source": source, "triples_loaded": count}
+
+    # ── Free-form SPARQL (read-only) ──────────────────────────────────────
+
+    async def sparql_query(self, query: str, limit: int = 100, max_chars: int = 50_000) -> dict:
+        """Run a caller-written SELECT / ASK / CONSTRUCT / DESCRIBE query over the whole
+        store (no implicit graph: use GRAPH <urn:olaf:{id}> to target an ontology).
+        Updates are rejected here and, independently, by Oxigraph's /query endpoint.
+        SELECT rows beyond `limit` and graph results beyond `max_chars` are truncated."""
+        form = _query_form(query)
+        if form not in _READ_QUERY_FORMS:
+            raise ValueError(
+                f"Only read-only queries are allowed ({', '.join(sorted(_READ_QUERY_FORMS))}); got {form or 'unknown'}."
+            )
+
+        if form in ("CONSTRUCT", "DESCRIBE"):
+            text = (await self._ex.execute_raw_query(query, "text/turtle")).text
+            return {"form": form, "turtle": text[:max_chars], "truncated": len(text) > max_chars}
+
+        data = (await self._ex.execute_raw_query(query, "application/sparql-results+json")).json()
+        if form == "ASK":
+            return {"form": form, "boolean": bool(data.get("boolean", False))}
+
+        variables = data.get("head", {}).get("vars", [])
+        bindings = data.get("results", {}).get("bindings", [])
+        rows = [{v: _fmt_http(b.get(v)) for v in variables} for b in bindings[:limit]]
+        return {
+            "form": form,
+            "variables": variables,
+            "rows": rows,
+            "row_count": len(bindings),
+            "truncated": len(bindings) > limit,
+        }
 
     # ── Export ────────────────────────────────────────────────────────────
 

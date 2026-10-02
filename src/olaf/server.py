@@ -548,6 +548,30 @@ def create_server(
                 },
             ),
             types.Tool(
+                name="sparql_query",
+                description=(
+                    "Run a read-only SPARQL 1.1 query (SELECT, ASK, CONSTRUCT or DESCRIBE) against the "
+                    "triplestore. INSERT/DELETE/LOAD/CLEAR and other updates are rejected. "
+                    "There is no implicit default graph: wrap patterns in GRAPH <urn:olaf:{ontology_id}> "
+                    "for an ontology (e.g. urn:olaf:main), GRAPH ?g with FILTER(STRSTARTS(STR(?g), "
+                    "'urn:olaf:seed:')) for seeds. Data model: classes are owl:Class, individuals "
+                    "owl:NamedIndividual, properties owl:ObjectProperty/owl:DatatypeProperty; labels are "
+                    "rdfs:label (language-tagged), aliases rdfs:altLabel, definitions skos:definition; "
+                    "provenance is <urn:olaf:extractedFrom> <urn:olaf:chunk:{chunk_id}> on entities and on "
+                    "rdf:Statement reification nodes for relations. "
+                    "SELECT returns {variables, rows, row_count, truncated}; ASK returns {boolean}; "
+                    "CONSTRUCT/DESCRIBE return Turtle. Syntax errors are returned verbatim — fix and retry."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Full SPARQL query, including PREFIX declarations"},
+                        "limit": {"type": "integer", "description": "Max SELECT rows returned (default: 100, max: 1000)"},
+                    },
+                    "required": ["query"],
+                },
+            ),
+            types.Tool(
                 name="ontology_orphans",
                 description=(
                     "Find classes and individuals with no relation to the rest of the ontology "
@@ -795,6 +819,10 @@ def create_server(
 
                 case "ontology_orphans":
                     return _text(await onto.orphans(oid, limit=arguments.get("limit", 100)))
+
+                case "sparql_query":
+                    limit = max(1, min(int(arguments.get("limit", 100)), 1000))
+                    return _text(await onto.sparql_query(arguments["query"], limit=limit))
 
                 case _:
                     return _err(f"Unknown tool: {name}")
