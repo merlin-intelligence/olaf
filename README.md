@@ -15,12 +15,12 @@ Text chunks (Qdrant)  ──►  LLM agent  ──►  OWL ontology (Oxigraph)
                               │  ▲
                      seed TTLs│  │ concept_search / concept_semantic_search
                               ▼  │
-                          30 MCP tools
+                          33 MCP tools
 ```
 
 **Storage split:**
 - **Oxigraph** — the ontologies (OWL/RDFS triples, named graphs, SPARQL), runs as a separate HTTP service
-- **Qdrant** — your existing chunk collection (read + status tracking) + one `olaf_concepts_{id}` collection per ontology for semantic search
+- **Qdrant** — your existing chunk collections (read + status tracking; each agent picks its collection with `chunk_collection_switch`) + one `olaf_concepts_{id}` collection per ontology for semantic search
 
 ---
 
@@ -46,7 +46,23 @@ docker compose up -d
 
 This starts two services:
 - **oxigraph** — RDF triplestore on port 7878, data persisted in a Docker volume
-- **olaf** — MCP server on port 8000 (SSE transport)
+- **olaf** — MCP server on port 8000 (SSE transport). The image includes the Java runtime used by the reasoner (`ontology_check`).
+
+On first start, the olaf service downloads the embedding model (a few hundred MB, ~1.1 GB for `multilingual-e5-base`) before accepting connections — wait for `Application startup complete` in `docker compose logs olaf`. The model is cached in the `olaf_models` volume, so later starts are fast.
+
+### Without Docker Compose (Oxigraph / Qdrant already running)
+
+If an Oxigraph or Qdrant instance is already running on this machine, `docker compose up` fails on the busy ports. Run only the OLAF image instead, on the host network so that `localhost` in `config.toml` reaches them:
+
+```bash
+docker build -t olaf .
+docker run --rm --network host \
+  -v "$PWD/config.toml:/app/config.toml:ro" \
+  -v olaf_models:/models \
+  olaf
+```
+
+CLI commands run the same way, e.g. `docker run --rm --network host -v "$PWD/config.toml:/app/config.toml:ro" olaf olaf reset-chunks`.
 
 ### Connecting from Claude Desktop
 
@@ -73,11 +89,11 @@ For a local Docker deployment, use `http://localhost:8000/sse`.
 ```toml
 [qdrant]
 url                 = "https://your-qdrant-instance.example.com"
-collection          = "chunks"           # your existing chunk collection
+collection          = "chunks"           # default chunk collection — each agent can pick its own
 concepts_collection = "olaf_concepts"    # prefix — actual collections are olaf_concepts_{ontology_id}
 
 [qdrant.field_mapping]
-# names of the payload fields in your existing collection
+# default names of the payload fields in your chunk collections
 text        = "text"
 doc_id      = "doc_id"
 chunk_index = "chunk_index"
@@ -90,8 +106,19 @@ base_uri     = "http://olaf.local/ontology#"   # namespace for generated URIs
 name         = "My Ontology"
 ontology_id  = "main"                          # active ontology (urn:olaf:main)
 
+[reasoner]
+enabled         = true     # ontology_check: Pellet OWL reasoner (needs Java 11+, included in the image)
+java            = "java"   # path to the java executable
+memory_mb       = 2048     # JVM max heap
+timeout_seconds = 120      # per reasoner call
+
 [embedding]
-model   = "intfloat/multilingual-e5-small"   # downloaded automatically via fastembed
+model   = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# Any model fastembed supports (TextEmbedding.list_supported_models()), plus
+# "intfloat/multilingual-e5-small" (384 d) and "intfloat/multilingual-e5-base" (768 d),
+# loaded from their ONNX export on Hugging Face (~0.5 GB / ~1.1 GB, downloaded on first start).
+# Concepts are indexed when they are created, and an existing index is not recomputed when
+# the model changes (vector sizes differ): after changing it, build into a new ontology_id.
 enabled = true
 ```
 
@@ -111,11 +138,13 @@ enabled = true
 | `ontology_summary` | Counts of classes, properties, individuals, restrictions, root classes, and chunk processing progress. Includes `active_ontology`. |
 | `ontology_export` | Export the active ontology as Turtle. Pass `include_seeds=true` to append all seed graphs. |
 | `ontology_orphans` | List classes/individuals with no relation to the rest of the graph beyond their own type/label/definition triples. |
+| `ontology_check` | Check the ontology for logical errors: Pellet OWL 2 DL reasoning (consistency + unsatisfiable classes, each with its explanation) plus closed-world SPARQL checks (subclass cycles, untyped individuals, domain/range violations, object/datatype property misuse). See [Consistency checking](#consistency-checking). |
 
 ### Chunks
 
 | Tool | Description |
 |------|-------------|
+| `chunk_collection_switch` | Switch the Qdrant collection the chunk tools read from, for this session only (default: `[qdrant].collection`). Optional `field_mapping` overrides the payload field names. Returns chunk counts. |
 | `chunk_list` | List chunks from Qdrant. Filter by `doc_id` and/or `status` (`pending`/`processed`/`all`). Returns `id`, `doc_id`, `chunk_index`, `text_preview` (200 chars), `status`. |
 | `chunk_read` | Read the full text of a chunk by its Qdrant point ID. |
 | `chunk_read_batch` | Read the full text of several chunks in one call. Returns `{id, doc_id, chunk_index, text, status}` for each. |
@@ -152,6 +181,7 @@ enabled = true
 | `relation_search` | Find triples by pattern. All three parameters are optional. |
 | `relation_sources` | Get the chunk IDs a `(subject, property, object)` triple was extracted from. |
 | `restriction_add` | Add an `owl:Restriction` blank node to a class. Supports `some`, `all`, `has_value`, `exactly`, `min`, `max`. |
+| `disjoint_add` | Declare 2+ classes pairwise disjoint (`owl:disjointWith`). Rejects non-classes and classes in a subclass relation. Undo a pair with `relation_delete`. |
 
 `restriction_add` produces:
 ```turtle
@@ -161,6 +191,17 @@ enabled = true
     owl:someValuesFrom :Engine
 ] .
 ```
+
+### Consistency checking
+
+`ontology_check` combines two kinds of checks, because OWL semantics alone catch few of the mistakes an extraction agent makes:
+
+- **Reasoner (open world).** The [Pellet](https://github.com/stardog-union/pellet) reasoner bundled with `owlready2` runs on the ontology's logical content (provenance triples and `owl:imports` are stripped). It reports whether the ontology is **consistent** and lists **unsatisfiable classes** — classes that can have no instance. Each problem comes with an *explanation*: the minimal set of axioms causing it, e.g. `Organisation disjointWith Person`, `Employee subClassOf Organisation`, `Employee subClassOf Person`. `entities` maps the local names used in explanations to full URIs. If the ontology is inconsistent, unsatisfiable classes are not computed: fix the inconsistency first and check again.
+- **Integrity checks (closed world, SPARQL).** In OWL, `rdfs:domain`/`rdfs:range` do not *constrain* — they *infer* types — and a relation between two classes (punning) is not constrained at all; a subclass cycle silently means equivalence. These checks report what the reasoner considers fine but is almost always an extraction error.
+
+The reasoner can only find contradictions the ontology states. **Without `owl:disjointWith` axioms, an ontology is almost never inconsistent** — declare sibling classes that cannot overlap disjoint with `disjoint_add`.
+
+Requires Java 11+ (included in the Docker image). Settings live under `[reasoner]` in `config.toml` (`enabled`, `java`, `memory_mb`, `timeout_seconds`). When the reasoner is disabled or Java is missing, `ontology_check` still runs the integrity checks and reports the reasoner error.
 
 ### Querying
 
@@ -189,6 +230,10 @@ olaf drop <ontology_id>
 
 # Delete a global seed
 olaf drop-seed <seed_id>
+
+# Mark processed chunks as pending again (all, or one document's), to rebuild an ontology.
+# Removes only the olaf_status / olaf_processed_at payload fields.
+olaf reset-chunks [doc_id] [--collection NAME]
 ```
 
 ---
@@ -198,6 +243,7 @@ olaf drop-seed <seed_id>
 ```
 1. ontology_list()                  → discover existing ontologies
 2. ontology_switch("my-project")    → or ontology_create("my-project", "My Project")
+   chunk_collection_switch("docs")   → optional: chunks from another collection than the server default
 3. ontology_summary()               → understand current state
 4. seed_list()                      → check available seeds
 5. seed_load("./domain.ttl")        → optionally load a reference ontology
@@ -207,11 +253,12 @@ For each chunk:
 7. chunk_read(chunk_id)
 8. concept_search(query) +          → run in parallel, deduplicate by URI
    concept_semantic_search(query)
-9. concept_create / property_create / relation_add / restriction_add
+9. concept_create / property_create / relation_add / restriction_add / disjoint_add
 10. chunk_mark_processed(chunk_id)
 
 11. ontology_orphans()               → connect or justify any isolated entity
-12. ontology_export()
+12. ontology_check()                 → fix each reported problem, check again until clean
+13. ontology_export()
 ```
 
 ### Querying workflow
@@ -253,6 +300,7 @@ Cloud agent    ──►│  MCP / SSE          │
                   │  ontology.py  ──────┼──► Oxigraph HTTP (port 7878)
                   │  chunks.py    ──────┼──► Qdrant
                   │  embeddings.py──────┼──► Qdrant (olaf_concepts)
+                  │  reasoner.py  ──────┼──► Pellet (Java subprocess)
                   │  server.py          │
                   └─────────────────────┘
 ```
@@ -263,6 +311,7 @@ src/olaf/
 ├── ontology.py     OntologyStore — HTTP SPARQL backend, all reads/writes
 ├── chunks.py       ChunkStore — Qdrant wrapper for existing chunk collection
 ├── embeddings.py   EmbeddingService — fastembed + olaf_concepts Qdrant collection
+├── reasoner.py     Reasoner — runs Pellet (bundled with owlready2) for ontology_check
 └── server.py       MCP server, tool registration, call dispatch, CLI commands
 ```
 
@@ -284,3 +333,4 @@ Change `base_uri` in config to use your own namespace.
 | `fastembed` | Lightweight ONNX-based embeddings (no PyTorch) |
 | `starlette` | ASGI framework for SSE transport |
 | `uvicorn` | ASGI server |
+| `owlready2` | Provides the Pellet OWL reasoner jars used by `ontology_check` (run with Java) |

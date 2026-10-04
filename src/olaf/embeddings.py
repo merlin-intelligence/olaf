@@ -22,26 +22,65 @@ _VECTOR_SIZE: dict[str, int] = {
 }
 
 
+# Models fastembed doesn't ship but that publish an ONNX export on Hugging Face: registered
+# with fastembed as custom models (mean pooling + normalisation, as sentence-transformers does).
+_CUSTOM_ONNX_MODELS: dict[str, dict] = {
+    "intfloat/multilingual-e5-small": {"dim": 384, "model_file": "onnx/model.onnx"},
+    "intfloat/multilingual-e5-base": {"dim": 768, "model_file": "onnx/model.onnx"},
+}
+
+
+def _register_custom_onnx(model_name: str) -> None:
+    from fastembed import TextEmbedding
+    from fastembed.common.model_description import ModelSource, PoolingType
+
+    spec = _CUSTOM_ONNX_MODELS.get(model_name)
+    if spec is None or any(m["model"] == model_name for m in TextEmbedding.list_supported_models()):
+        return
+    TextEmbedding.add_custom_model(
+        model=model_name,
+        pooling=PoolingType.MEAN,
+        normalization=True,
+        sources=ModelSource(hf=model_name),
+        dim=spec["dim"],
+        model_file=spec["model_file"],
+    )
+
+
+def preload_model(model_name: str) -> None:
+    """Load (and download, the first time) the model into the process-wide cache.
+    Called at server startup so no client connection has to wait for it."""
+    EmbeddingService._load(model_name)
+
+
 class EmbeddingService:
     def __init__(self, model_name: str, client: QdrantClient, collection: str):
         self.model_name = model_name
         self.client = client
         self.collection = collection
         self._known_collections: set[str] = set()
+        # Load the model now, so a missing/unsupported model disables embeddings at
+        # connection time (with a warning) instead of failing every concept_create.
+        self._model_instance()
         self._ensure_collection()
 
     def _model_instance(self):
-        if self.model_name not in _model_cache:
+        return self._load(self.model_name)
+
+    @staticmethod
+    def _load(model_name: str):
+        if model_name not in _model_cache:
             try:
                 from fastembed import TextEmbedding
-                _model_cache[self.model_name] = ("fastembed", TextEmbedding(self.model_name))
+                _register_custom_onnx(model_name)
+                _model_cache[model_name] = ("fastembed", TextEmbedding(model_name))
             except Exception:
                 try:
                     from sentence_transformers import SentenceTransformer
-                    _model_cache[self.model_name] = ("sentence_transformers", SentenceTransformer(self.model_name))
+                    _model_cache[model_name] = ("sentence_transformers", SentenceTransformer(model_name))
                 except Exception as e:
-                    raise RuntimeError(f"Could not load embedding model {self.model_name}: {e}") from e
-        return _model_cache[self.model_name]
+                    raise RuntimeError(f"Could not load embedding model {model_name}: {e}") from e
+        return _model_cache[model_name]
 
     def _vector_size(self) -> int:
         if self.model_name in _VECTOR_SIZE:
@@ -65,9 +104,10 @@ class EmbeddingService:
 
     def _embed(self, text: str, is_query: bool = False) -> list[float]:
         kind, model = self._model_instance()
-        if kind == "fastembed":
-            return list(next(iter(model.embed([text]))).tolist())
+        # e5 models are trained with these prefixes; neither backend adds them on its own.
         prefix = ("query: " if is_query else "passage: ") if "e5" in self.model_name.lower() else ""
+        if kind == "fastembed":
+            return list(next(iter(model.embed([f"{prefix}{text}"]))).tolist())
         return model.encode(f"{prefix}{text}").tolist()
 
     def _concept_point_id(self, uri: str) -> str:

@@ -11,10 +11,23 @@ _PROCESSED_AT_FIELD = "olaf_processed_at"
 
 
 class ChunkStore:
-    def __init__(self, url: str, collection: str, field_mapping: FieldMapping, api_key: str | None = None):
-        self.client = QdrantClient(url=url, api_key=api_key)
+    def __init__(
+        self,
+        url: str,
+        collection: str,
+        field_mapping: FieldMapping,
+        api_key: str | None = None,
+        client: QdrantClient | None = None,
+    ):
+        self.client = client or QdrantClient(url=url, api_key=api_key)
         self.collection = collection
         self.fm = field_mapping
+
+    def for_collection(self, collection: str, field_mapping: FieldMapping | None = None) -> "ChunkStore":
+        """A store on another collection of the same Qdrant instance, sharing the client."""
+        if not self.client.collection_exists(collection):
+            raise ValueError(f"Qdrant collection not found: {collection!r}")
+        return ChunkStore("", collection, field_mapping or self.fm, client=self.client)
 
     def _to_dict(self, point) -> dict:
         p = point.payload or {}
@@ -122,6 +135,22 @@ class ChunkStore:
             return True
         except Exception:
             return False
+
+    def reset_processed(self, doc_id: str | None = None) -> int:
+        """Remove the olaf status fields from processed chunks (all, or one document's) so
+        they are pending again. Other payload fields are untouched. Returns the reset count."""
+        must = [FieldCondition(key=_STATUS_FIELD, match=MatchValue(value="processed"))]
+        if doc_id:
+            must.append(FieldCondition(key=self.fm.doc_id, match=MatchValue(value=doc_id)))
+        processed = Filter(must=must)
+        count = self.client.count(collection_name=self.collection, count_filter=processed).count
+        if count:
+            self.client.delete_payload(
+                collection_name=self.collection,
+                keys=[_STATUS_FIELD, _PROCESSED_AT_FIELD],
+                points=processed,
+            )
+        return count
 
     def count_total(self) -> int:
         return self.client.count(collection_name=self.collection).count

@@ -12,9 +12,10 @@ from mcp.server.stdio import stdio_server
 from qdrant_client import QdrantClient
 
 from .chunks import ChunkStore
-from .config import Config
-from .embeddings import EmbeddingService
+from .config import Config, FieldMapping
+from .embeddings import EmbeddingService, preload_model
 from .ontology import OntologyStore
+from .reasoner import Reasoner
 
 
 def _text(content: Any) -> list[types.TextContent]:
@@ -26,8 +27,19 @@ def _err(msg: str) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=f"Error: {msg}")]
 
 
+async def _preload_embeddings(config: Config) -> None:
+    if not config.embedding.enabled:
+        return
+    print(f"Loading embedding model {config.embedding.model}…", file=sys.stderr)
+    try:
+        await asyncio.to_thread(preload_model, config.embedding.model)
+    except Exception as e:
+        print(f"Warning: embeddings disabled ({e})", file=sys.stderr)
+
+
 async def _make_shared_infra(config: Config) -> tuple[OntologyStore, QdrantClient, ChunkStore]:
     """Create and bootstrap infrastructure objects shared across all SSE connections."""
+    await _preload_embeddings(config)
     onto = OntologyStore(url=config.oxigraph.url)
     await onto.bootstrap(config.ontology.ontology_id, config.ontology.base_uri, config.ontology.name)
     qdrant = QdrantClient(url=config.qdrant.url, api_key=config.qdrant.api_key)
@@ -48,11 +60,12 @@ def create_server(
     OntologyStore (stateless) and QdrantClient serve all connections.
     For stdio, create them first with _make_shared_infra and pass them in.
     """
-    # Per-session state: only the active ontology context.
+    # Per-session state: the active ontology context and chunk collection.
     # Using a dict so the call_tool closure can mutate it without `nonlocal`.
-    session: dict[str, str] = {
+    session: dict[str, Any] = {
         "ontology_id": config.ontology.ontology_id,
         "base_uri": config.ontology.base_uri,
+        "chunks": chunks,
     }
 
     embed: EmbeddingService | None = None
@@ -63,11 +76,49 @@ def create_server(
         except Exception as e:
             print(f"Warning: embeddings disabled ({e})", file=sys.stderr)
 
+    reasoner: Reasoner | None = None
+    if config.reasoner.enabled:
+        reasoner = Reasoner(config.reasoner.java, config.reasoner.memory_mb, config.reasoner.timeout_seconds)
+
+    def _index(action) -> str | None:
+        """Update the semantic index. The ontology change is already written at this point,
+        so a failure is reported as a warning instead of turning the call into an error."""
+        try:
+            action()
+            return None
+        except Exception as e:
+            print(f"Warning: semantic index not updated ({e})", file=sys.stderr)
+            return f"Ontology updated, but the semantic index (concept_semantic_search) was not: {e}"
+
     server = Server("olaf")
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
         return [
+            types.Tool(
+                name="chunk_collection_switch",
+                description=(
+                    "Switch the Qdrant collection the chunk tools read from, for this session only "
+                    "(default: the server's configured collection). Optionally override the payload "
+                    "field names if this collection uses different ones. Returns chunk counts."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "collection": {"type": "string", "description": "Qdrant collection name"},
+                        "field_mapping": {
+                            "type": "object",
+                            "description": "Payload field names (default: the server's [qdrant.field_mapping])",
+                            "properties": {
+                                "text": {"type": "string"},
+                                "doc_id": {"type": "string"},
+                                "chunk_index": {"type": "string"},
+                            },
+                        },
+                    },
+                    "required": ["collection"],
+                },
+            ),
             types.Tool(
                 name="chunk_list",
                 description=(
@@ -465,6 +516,28 @@ def create_server(
                 },
             ),
             types.Tool(
+                name="disjoint_add",
+                description=(
+                    "Declare classes pairwise disjoint (owl:disjointWith): no individual can belong to two "
+                    "of them. Use for sibling classes that cannot overlap, e.g. Person / Organisation / Document. "
+                    "Without disjointness the reasoner (ontology_check) can almost never detect a contradiction. "
+                    "Rejected if two of the classes are in a subclass relation. "
+                    "Each pair is stored once as <a> owl:disjointWith <b>; undo it with relation_delete."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "class_uris": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 2,
+                            "description": "URIs of the classes to declare mutually disjoint (2 or more)",
+                        },
+                    },
+                    "required": ["class_uris"],
+                },
+            ),
+            types.Tool(
                 name="seed_list",
                 description="List all seed ontologies loaded in the store (shared across all ontologies).",
                 inputSchema={"type": "object", "properties": {}},
@@ -585,13 +658,53 @@ def create_server(
                     },
                 },
             ),
+            types.Tool(
+                name="ontology_check",
+                description=(
+                    "Check the ontology for logical errors. Runs (1) the Pellet OWL 2 DL reasoner: global "
+                    "consistency and unsatisfiable classes (classes that can have no instance), each with its "
+                    "explanation, the minimal set of axioms causing it; and (2) closed-world SPARQL checks the "
+                    "reasoner does not report: subclass cycles, untyped individuals, relations whose subject/object "
+                    "does not match the property's domain/range, and object/datatype property misuse. "
+                    "`entities` maps the local names used in explanations to their URIs. "
+                    "Fix each problem by removing or correcting at least one axiom of its explanation "
+                    "(relation_delete, property_update, concept_merge…), then check again."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "include_seeds": {
+                            "type": "boolean",
+                            "description": "Reason over the seed graphs too (default: false)",
+                        },
+                        "max_explanations": {
+                            "type": "integer",
+                            "description": "Explanations per problem (default: 1, max: 5)",
+                        },
+                        "limit": {"type": "integer", "description": "Max results per SPARQL check (default: 50)"},
+                    },
+                },
+            ),
         ]
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         try:
             oid = session["ontology_id"]
+            chunks: ChunkStore = session["chunks"]
             match name:
+                case "chunk_collection_switch":
+                    fm = arguments.get("field_mapping")
+                    session["chunks"] = chunks.for_collection(
+                        arguments["collection"],
+                        FieldMapping(**{**vars(config.qdrant.field_mapping), **fm}) if fm else None,
+                    )
+                    return _text({
+                        "collection": arguments["collection"],
+                        "chunks_total": session["chunks"].count_total(),
+                        "chunks_processed": session["chunks"].count_processed(),
+                    })
+
                 case "chunk_list":
                     return _text(chunks.list_chunks(
                         doc_id=arguments.get("doc_id"),
@@ -629,8 +742,10 @@ def create_server(
                         lang=arguments.get("language", "en"),
                         source_chunk_id=source_chunk_id,
                     )
-                    if result["created"] and embed:
-                        embed.upsert_concept(result["uri"], arguments["label"], arguments["definition"], source_chunk_id)
+                    if result["created"] and embed and (warning := _index(lambda: embed.upsert_concept(
+                        result["uri"], arguments["label"], arguments["definition"], source_chunk_id
+                    ))):
+                        result["warning"] = warning
                     return _text(result)
 
                 case "concept_get":
@@ -657,12 +772,10 @@ def create_server(
                     )
                     if embed and (arguments.get("label") or arguments.get("definition")):
                         concept = await onto.concept_get(oid, arguments["uri"])
-                        if concept and concept.get("label"):
-                            embed.upsert_concept(
-                                arguments["uri"],
-                                concept["label"],
-                                concept.get("definition", ""),
-                            )
+                        if concept and concept.get("label") and (warning := _index(lambda: embed.upsert_concept(
+                            arguments["uri"], concept["label"], concept.get("definition", "")
+                        ))):
+                            return _text({"status": "ok", "warning": warning})
                     return _text("ok")
 
                 case "individual_create":
@@ -676,21 +789,24 @@ def create_server(
                         lang=arguments.get("language", "en"),
                         source_chunk_id=source_chunk_id,
                     )
-                    if result["created"] and embed:
-                        embed.upsert_concept(result["uri"], arguments["label"], arguments.get("definition", ""), source_chunk_id)
+                    if result["created"] and embed and (warning := _index(lambda: embed.upsert_concept(
+                        result["uri"], arguments["label"], arguments.get("definition", ""), source_chunk_id
+                    ))):
+                        result["warning"] = warning
                     return _text(result)
 
                 case "concept_merge":
                     await onto.concept_merge(oid, arguments["keep_uri"], arguments["merge_uri"])
                     if embed:
-                        embed.delete_concept(arguments["merge_uri"])
                         concept = await onto.concept_get(oid, arguments["keep_uri"])
-                        if concept and concept.get("label"):
-                            embed.upsert_concept(
-                                arguments["keep_uri"],
-                                concept["label"],
-                                concept.get("definition", ""),
-                            )
+
+                        def reindex() -> None:
+                            embed.delete_concept(arguments["merge_uri"])
+                            if concept and concept.get("label"):
+                                embed.upsert_concept(arguments["keep_uri"], concept["label"], concept.get("definition", ""))
+
+                        if warning := _index(reindex):
+                            return _text({"status": "ok", "warning": warning})
                     return _text("ok")
 
                 case "property_create":
@@ -776,6 +892,9 @@ def create_server(
                     )
                     return _text({"restriction_bnode": bnode})
 
+                case "disjoint_add":
+                    return _text(await onto.disjoint_add(oid, arguments["class_uris"]))
+
                 case "seed_list":
                     return _text(await onto.seed_list())
 
@@ -820,6 +939,26 @@ def create_server(
                 case "ontology_orphans":
                     return _text(await onto.orphans(oid, limit=arguments.get("limit", 100)))
 
+                case "ontology_check":
+                    report: dict[str, Any] = {}
+                    if reasoner:
+                        try:
+                            data = await onto.reasoner_input(oid, include_seeds=arguments.get("include_seeds", False))
+                            max_explanations = max(1, min(int(arguments.get("max_explanations", 1)), 5))
+                            report["reasoner"] = await reasoner.check(data, max_explanations=max_explanations)
+                        except Exception as e:
+                            report["reasoner"] = {"error": str(e)}
+                    else:
+                        report["reasoner"] = {"error": "Reasoner disabled in config ([reasoner] enabled = false)"}
+                    report["integrity"] = await onto.integrity_checks(oid, limit=arguments.get("limit", 50))
+                    r = report["reasoner"]
+                    report["issues"] = (
+                        (0 if r.get("consistent", True) else 1)
+                        + len(r.get("unsatisfiable_classes", []))
+                        + sum(len(v) for v in report["integrity"].values())
+                    )
+                    return _text(report)
+
                 case "sparql_query":
                     limit = max(1, min(int(arguments.get("limit", 100)), 1000))
                     return _text(await onto.sparql_query(arguments["query"], limit=limit))
@@ -845,6 +984,7 @@ def _make_sse_app(config: Config):
     @asynccontextmanager
     async def lifespan(app):
         await onto.bootstrap(config.ontology.ontology_id, config.ontology.base_uri, config.ontology.name)
+        await _preload_embeddings(config)
         yield
 
     transport = SseServerTransport("/messages/")
@@ -906,6 +1046,21 @@ def _cmd_drop_seed(seed_id: str) -> None:
     asyncio.run(_inner())
 
 
+def _cmd_reset_chunks(argv: list[str]) -> None:
+    import argparse
+    parser = argparse.ArgumentParser(prog="olaf reset-chunks")
+    parser.add_argument("doc_id", nargs="?", help="Only reset this document's chunks")
+    parser.add_argument("--collection", help="Qdrant collection (default: [qdrant].collection)")
+    args = parser.parse_args(argv)
+
+    config = Config.load()
+    collection = args.collection or config.qdrant.collection
+    chunks = ChunkStore(config.qdrant.url, collection, config.qdrant.field_mapping, config.qdrant.api_key)
+    count = chunks.reset_processed(args.doc_id)
+    scope = f"du document '{args.doc_id}' " if args.doc_id else ""
+    print(f"{count} chunk(s) {scope}de la collection '{collection}' remis en attente.")
+
+
 def main() -> None:
     if len(sys.argv) >= 2:
         match sys.argv[1]:
@@ -919,6 +1074,8 @@ def main() -> None:
                     print("Usage: olaf drop-seed <seed_id>", file=sys.stderr)
                     sys.exit(1)
                 _cmd_drop_seed(sys.argv[2])
+            case "reset-chunks":
+                _cmd_reset_chunks(sys.argv[2:])
             case _:
                 asyncio.run(_run())
     else:

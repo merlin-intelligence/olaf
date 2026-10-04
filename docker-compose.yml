@@ -18,6 +18,7 @@ services:
       MCP_PORT: "8000"
     volumes:
       - ./config.toml:/app/config.toml:ro
+      - olaf_models:/models            # embedding model cache (downloaded once)
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -26,3 +27,4 @@ services:
 
 volumes:
   oxigraph_data:
+  olaf_models:
