@@ -31,9 +31,16 @@ model       = "claude-sonnet-4-6"
 max_tokens  = 4096
 temperature = 0
 
+# Seconds per LLM call before giving up. Raise this for reasoning models (e.g. ones that
+# "think" before answering) which can take a while to produce a large max_tokens response.
+timeout = 120
+
 # Retries when the provider answers 429 (rate limit / tokens-per-minute quota),
 # waiting 15s, 30s, then 60s between attempts.
 rate_limit_retries = 6
+
+# Retries when a call times out, cannot connect, or gets a 5xx error (10s pause each).
+transient_retries = 2
 
 # Optional — custom endpoint for OpenAI-compatible providers (Scaleway, vLLM…).
 # api_key_env is the NAME of the env var holding the key (the key itself stays out of the file).

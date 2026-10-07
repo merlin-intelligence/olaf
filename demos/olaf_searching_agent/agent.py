@@ -105,7 +105,7 @@ class SearchingAgent:
             tool_choice=tool_choice,
             max_tokens=self.llm_cfg.get("max_tokens", 4096),
             temperature=self.llm_cfg.get("temperature", 0),
-            timeout=120,
+            timeout=self.llm_cfg.get("timeout", 120),
         )
 
     async def ask(self, question: str) -> str:
@@ -234,19 +234,42 @@ def _endpoint_kwargs(llm_cfg: dict) -> dict:
     return kwargs
 
 
+# Errors worth retrying as-is: the provider was slow or briefly unavailable.
+_TRANSIENT_ERRORS = (
+    litellm.Timeout,
+    litellm.APIConnectionError,
+    litellm.InternalServerError,
+    litellm.ServiceUnavailableError,
+)
+
+
 def _completion(llm_cfg: dict, **kwargs):
-    """litellm.completion, retried on rate limits (HTTP 429) with a growing wait.
-    Quotas are usually per minute, so the wait goes up to a full minute."""
-    retries = llm_cfg.get("rate_limit_retries", 6)
-    for attempt in range(retries + 1):
+    """litellm.completion, retried on rate limits (HTTP 429) with a growing wait — quotas
+    are usually per minute, so the wait goes up to a full minute — and on transient errors
+    (timeout, connection, 5xx), which are retried a few times after a short pause."""
+    rate_limit_retries = llm_cfg.get("rate_limit_retries", 6)
+    transient_retries = llm_cfg.get("transient_retries", 2)
+    rate_limited = transient = 0
+    while True:
         try:
             return litellm.completion(**kwargs, **_endpoint_kwargs(llm_cfg))
         except litellm.RateLimitError:
-            if attempt == retries:
+            if rate_limited == rate_limit_retries:
                 raise
-            wait = min(15 * 2 ** attempt, 60)
-            logger.warning("Rate limited by the LLM provider — retrying in %ds (%d/%d).", wait, attempt + 1, retries)
+            wait = min(15 * 2 ** rate_limited, 60)
+            rate_limited += 1
+            logger.warning(
+                "Rate limited by the LLM provider — retrying in %ds (%d/%d).", wait, rate_limited, rate_limit_retries
+            )
             time.sleep(wait)
+        except _TRANSIENT_ERRORS as exc:
+            if transient == transient_retries:
+                raise
+            transient += 1
+            logger.warning(
+                "LLM call failed (%s) — retrying in 10s (%d/%d).", type(exc).__name__, transient, transient_retries
+            )
+            time.sleep(10)
 
 
 def _summarise(args: dict) -> str:

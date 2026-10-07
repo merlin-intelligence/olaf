@@ -2,7 +2,7 @@ SYSTEM_PROMPT = """You are an ontology engineer agent. You build a coherent OWL/
 using the OLAF MCP tools available to you.
 
 The pipeline around you is driven by code: it hands you one task at a time (extract from a batch
-of chunks, review duplicate candidates, fix consistency issues), reads and marks the chunks, and
+of chunks, review duplicate candidates), reads and marks the chunks, and
 exports the ontology. Do only the task you are given, then reply with a short plain-text summary
 of what you did (no tool call) — that reply ends the task.
 
@@ -22,7 +22,7 @@ of what you did (no tool call) — that reply ends the task.
   "Investment Fund" (both kinds of "Financial Institution") likely are too.
   Only declare it when the classes truly exclude each other — never between a class and its
   ancestor, and not for classes that merely look different but can overlap
-  (e.g. "Employee" and "Shareholder"). Disjointness is what lets the consistency check detect errors.
+  (e.g. "Employee" and "Shareholder"). Disjointness is what lets the reasoner detect errors.
 - A flat list of concepts with no relations is not a valid ontology: extract properties too.
 - Never encode the same pair of entities both ways: if "Green Bond" is already
   `rdfs:subClassOf` "Financial Instrument", do not also add an object property like
@@ -91,27 +91,3 @@ skip the pair.
 {pairs}
 """
 
-
-CHECK_PROMPT = """## Task: fix consistency issues
-
-The ontology check below found logical problems and/or isolated entities. Fix them:
-- Reasoner problems (`inconsistency`, `unsatisfiable_classes`) come with explanations: the minimal
-  set of axioms causing each one. Remove or correct at least one wrong axiom of each explanation.
-  `entities` maps the local names used in explanations to their URIs.
-- Integrity problems: subclass cycles, untyped individuals, relations whose subject/object does
-  not match the property's domain/range, object/datatype property misuse.
-- `orphans`: classes/individuals with no relation to the rest of the ontology. Connect each one
-  (`relation_add`, `concept_create` parent, `owl:equivalentClass`/`rdfs:subClassOf` to a seed
-  concept) when the source text supports it; otherwise leave it and say so in your summary.
-
-Before changing an axiom, check what the source text says (`concept_get` / `relation_sources`
-give the source chunk ids, `chunk_read_batch` reads them) and fix the axiom that is actually
-wrong. Don't delete a correct axiom just to silence the check — if the text supports a
-domain/range violation, widen the property's domain/range instead.
-Call `ontology_check` again after your fixes, and repeat until it reports 0 issues (or explain
-in your summary what is left and why).
-
-## Check report
-
-{report}
-"""

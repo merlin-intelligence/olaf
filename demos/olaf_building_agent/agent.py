@@ -6,8 +6,7 @@ The code drives the pipeline; the LLM does the ontology work through tool calls:
      LLM conversation given the chunks and a digest of the current ontology. The code marks
      the chunks processed once the batch is done.
   2. Consolidation (`consolidate = true`) — near-duplicate classes found with the concept
-     embeddings are reviewed by the LLM (merge or keep), then `ontology_check` + orphans are
-     run and the LLM fixes what they report.
+     embeddings are reviewed by the LLM (merge or keep).
   3. Export — the ontology is written to `export_path`.
 
 Usage:
@@ -30,7 +29,7 @@ import litellm
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
-from prompts import BATCH_PROMPT, CHECK_PROMPT, DEDUP_PROMPT, SYSTEM_PROMPT
+from prompts import BATCH_PROMPT, DEDUP_PROMPT, SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -53,19 +52,42 @@ def _endpoint_kwargs(llm_cfg: dict) -> dict:
     return kwargs
 
 
+# Errors worth retrying as-is: the provider was slow or briefly unavailable.
+_TRANSIENT_ERRORS = (
+    litellm.Timeout,
+    litellm.APIConnectionError,
+    litellm.InternalServerError,
+    litellm.ServiceUnavailableError,
+)
+
+
 def _completion(llm_cfg: dict, **kwargs):
-    """litellm.completion, retried on rate limits (HTTP 429) with a growing wait.
-    Quotas are usually per minute, so the wait goes up to a full minute."""
-    retries = llm_cfg.get("rate_limit_retries", 6)
-    for attempt in range(retries + 1):
+    """litellm.completion, retried on rate limits (HTTP 429) with a growing wait — quotas
+    are usually per minute, so the wait goes up to a full minute — and on transient errors
+    (timeout, connection, 5xx), which are retried a few times after a short pause."""
+    rate_limit_retries = llm_cfg.get("rate_limit_retries", 6)
+    transient_retries = llm_cfg.get("transient_retries", 2)
+    rate_limited = transient = 0
+    while True:
         try:
             return litellm.completion(**kwargs, **_endpoint_kwargs(llm_cfg))
         except litellm.RateLimitError:
-            if attempt == retries:
+            if rate_limited == rate_limit_retries:
                 raise
-            wait = min(15 * 2 ** attempt, 60)
-            logger.warning("Rate limited by the LLM provider — retrying in %ds (%d/%d).", wait, attempt + 1, retries)
+            wait = min(15 * 2 ** rate_limited, 60)
+            rate_limited += 1
+            logger.warning(
+                "Rate limited by the LLM provider — retrying in %ds (%d/%d).", wait, rate_limited, rate_limit_retries
+            )
             time.sleep(wait)
+        except _TRANSIENT_ERRORS as exc:
+            if transient == transient_retries:
+                raise
+            transient += 1
+            logger.warning(
+                "LLM call failed (%s) — retrying in 10s (%d/%d).", type(exc).__name__, transient, transient_retries
+            )
+            time.sleep(10)
 
 
 # ─── Tool conversion ──────────────────────────────────────────────────────────
@@ -122,8 +144,8 @@ def prune_history(
 # Pipeline steps done by the code itself (reading/marking chunks, export) or not part of any
 # task: hidden from the LLM, and refused if called anyway.
 PIPELINE_TOOLS = SESSION_TOOLS | {"chunk_list", "chunk_mark_processed", "ontology_export", "seed_load"}
-# Consistency checking belongs to the consolidation phase, not to extraction.
-EXTRACTION_HIDDEN = PIPELINE_TOOLS | {"ontology_check", "ontology_orphans"}
+# Consistency checking and repair is olaf_reasoning_agent's job, run after this one.
+HIDDEN_TOOLS = PIPELINE_TOOLS | {"ontology_check", "ontology_orphans"}
 
 _PROPERTIES_QUERY = """
 PREFIX owl:  <http://www.w3.org/2002/07/owl#>
@@ -148,7 +170,7 @@ SELECT ?c (SAMPLE(?l) AS ?label) WHERE {
 
 class BuildingAgent:
     """Code-driven pipeline: extraction by batches of chunks, then consolidation
-    (deduplication + consistency check), then export. Each batch and each consolidation
+    (deduplication), then export. Each batch and each consolidation
     task is a fresh LLM conversation, so the context size does not grow with the corpus."""
 
     def __init__(self, session: ClientSession, config: dict, mcp_tools: list):
@@ -169,8 +191,7 @@ class BuildingAgent:
         self.pruned_result_chars = agent_cfg.get("pruned_result_chars", 500)
         self.max_history_turns = agent_cfg.get("max_history_turns", 20)
 
-        self.extraction_tools = mcp_tools_to_litellm([t for t in mcp_tools if t.name not in EXTRACTION_HIDDEN])
-        self.consolidation_tools = mcp_tools_to_litellm([t for t in mcp_tools if t.name not in PIPELINE_TOOLS])
+        self.tools = mcp_tools_to_litellm([t for t in mcp_tools if t.name not in HIDDEN_TOOLS])
 
     # ── Tool calls ────────────────────────────────────────────────────────
 
@@ -227,7 +248,7 @@ class BuildingAgent:
                 tool_choice="auto",
                 max_tokens=self.llm_cfg.get("max_tokens", 4096),
                 temperature=self.llm_cfg.get("temperature", 0),
-                timeout=120,
+                timeout=self.llm_cfg.get("timeout", 120),
             )
             msg = response.choices[0].message
 
@@ -322,7 +343,7 @@ class BuildingAgent:
                 for c in chunks if "error" not in c
             )
             task = BATCH_PROMPT.format(batch_number=batch_number, digest=await self.digest(), chunks=chunks_text)
-            await self.converse(task, self.extraction_tools, EXTRACTION_HIDDEN, f"batch {batch_number}")
+            await self.converse(task, self.tools, HIDDEN_TOOLS, f"batch {batch_number}")
 
             # If the batch failed (LLM error), the exception stops the run before this point:
             # its chunks stay pending and are picked up again on the next run.
@@ -370,28 +391,9 @@ class BuildingAgent:
             group = ordered[start : start + self.dedup_pairs_per_task]
             text = "\n".join(f"- score {score:.3f}\n  A: {describe(a)}\n  B: {describe(b)}" for (a, b), score in group)
             await self.converse(
-                DEDUP_PROMPT.format(pairs=text), self.consolidation_tools, PIPELINE_TOOLS,
+                DEDUP_PROMPT.format(pairs=text), self.tools, HIDDEN_TOOLS,
                 f"dedup {start // self.dedup_pairs_per_task + 1}",
             )
-
-    async def check(self) -> None:
-        report = json.loads(await self._call("ontology_check"))
-        orphans = json.loads(await self._call("ontology_orphans"))
-        if error := report.get("reasoner", {}).get("error"):
-            logger.warning("Reasoner unavailable, only the SPARQL checks ran: %s", error)
-        if report["issues"] == 0 and not orphans:
-            logger.info("Consistency check: no issues, no orphans.")
-            return
-
-        logger.info("Consistency check: %d issues, %d orphans — asking the LLM to fix them.", report["issues"], len(orphans))
-        await self.converse(
-            CHECK_PROMPT.format(report=json.dumps({**report, "orphans": orphans}, indent=1, ensure_ascii=False)),
-            self.consolidation_tools, PIPELINE_TOOLS, "check",
-        )
-        final = json.loads(await self._call("ontology_check"))
-        (logger.info if final["issues"] == 0 else logger.warning)(
-            "Consistency check after fixes: %d issues left.", final["issues"]
-        )
 
     # ── Run ───────────────────────────────────────────────────────────────
 
@@ -399,7 +401,6 @@ class BuildingAgent:
         await self.extract()
         if self.consolidate:
             await self.deduplicate()
-            await self.check()
 
         if self.export_path:
             with open(self.export_path, "w", encoding="utf-8") as f:

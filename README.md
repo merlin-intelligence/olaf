@@ -8,7 +8,7 @@
 
 OLAF exposes a set of MCP tools that let an LLM agent construct a formal OWL/RDFS ontology from raw text chunks. The agent reads chunks, extracts concepts and relations, checks for duplicates, and builds up the ontology piece by piece — resuming at any point without losing work.
 
-Once built, the ontology can be queried the same way: read-only tools and `sparql_query` let an agent answer natural-language questions and trace each fact back to its source chunks. See [`demos/`](demos/) for a building agent and a searching agent.
+Once built, the ontology can be queried the same way: read-only tools and `sparql_query` let an agent answer natural-language questions and trace each fact back to its source chunks. See [`demos/`](demos/) for a building agent, a reasoning agent that repairs the built ontology, and a searching agent.
 
 ```
 Text chunks (Qdrant)  ──►  LLM agent  ──►  OWL ontology (Oxigraph)
@@ -161,7 +161,7 @@ enabled = true
 | `concept_get` | Get all triples for a concept: type, label, definition, aliases, `subClassOf`, restrictions, `source_chunk_ids`. |
 | `concept_update` | Update label, definition, or aliases (`aliases_add` / `aliases_remove`). |
 | `individual_create` | Create an `owl:NamedIndividual` (a specific named entity such as "GDPR") as an instance of `class_uri`. Returns `{uri, created}`. If it already exists, `source_chunk_id` is added to its sources. |
-| `concept_merge` | Merge two concepts: all triples from `merge_uri` move to `keep_uri`, all references re-pointed, `merge_uri` deleted. |
+| `concept_merge` | Merge two concepts: all triples from `merge_uri` move to `keep_uri`, all references re-pointed, `merge_uri` deleted. A relation between the two (e.g. `merge_uri` subClassOf `keep_uri`) is dropped rather than turned into a self-loop. |
 
 ### Properties (`owl:ObjectProperty` / `owl:DatatypeProperty`)
 
@@ -200,6 +200,8 @@ enabled = true
 - **Integrity checks (closed world, SPARQL).** In OWL, `rdfs:domain`/`rdfs:range` do not *constrain* — they *infer* types — and a relation between two classes (punning) is not constrained at all; a subclass cycle silently means equivalence. These checks report what the reasoner considers fine but is almost always an extraction error.
 
 The reasoner can only find contradictions the ontology states. **Without `owl:disjointWith` axioms, an ontology is almost never inconsistent** — declare sibling classes that cannot overlap disjoint with `disjoint_add`.
+
+[`olaf_reasoning_agent`](demos/olaf_reasoning_agent/) runs these checks on a built ontology and has an LLM repair what they report.
 
 Requires Java 11+ (included in the Docker image). Settings live under `[reasoner]` in `config.toml` (`enabled`, `java`, `memory_mb`, `timeout_seconds`). When the reasoner is disabled or Java is missing, `ontology_check` still runs the integrity checks and reports the reasoner error.
 

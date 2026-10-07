@@ -13,11 +13,10 @@ LiteLLM   ──API──▶  Claude / OpenAI / Ollama
 The code drives the pipeline; the LLM does the ontology work through OLAF tool calls. Each step below is a **fresh LLM conversation**, so the prompt size depends on `batch_size`, not on how far the build has gone — which keeps token usage per call bounded (and within provider rate limits).
 
 1. **Extraction** — pending chunks are processed by batches of `batch_size`. Each batch gets the chunk texts plus a digest of the current ontology (existing classes, properties and seed classes with their URIs), so the LLM reuses them instead of re-creating them. Once the LLM is done, the pipeline marks the chunks processed: an interrupted run resumes where it stopped.
-2. **Consolidation** (`consolidate = true`)
-   - *Deduplication* — classes whose embeddings are closer than `dedup_threshold` are reviewed by the LLM, `dedup_pairs_per_task` pairs at a time: merge (`concept_merge`) or keep.
-   - *Consistency* — `ontology_check` (reasoner + integrity checks) and `ontology_orphans` run; if they report anything, the LLM fixes it and re-checks.
-   No LLM call is made when there is nothing to review or fix.
+2. **Consolidation** (`consolidate = true`) — classes whose embeddings are closer than `dedup_threshold` are reviewed by the LLM, `dedup_pairs_per_task` pairs at a time: merge (`concept_merge`) or keep. No LLM call is made when there is nothing to review.
 3. **Export** — the ontology is written to `export_path`.
+
+Logical problems (reasoner, integrity checks, orphans) are not fixed here: run [`olaf_reasoning_agent`](../olaf_reasoning_agent/) on the ontology once it is built.
 
 Within a step, the LLM loops on tool calls until it replies with a plain-text summary (at most `max_iterations` rounds); older tool results are pruned from its context as it goes.
 
@@ -55,7 +54,7 @@ temperature = 0
 [agent]
 batch_size     = 5                       # chunks per extraction batch
 max_batches    = 0                       # 0 = all pending chunks
-consolidate    = true                    # deduplication + consistency fixes after extraction
+consolidate    = true                    # deduplication after extraction
 max_iterations = 30                      # max LLM rounds per task
 export_path    = "ontology_output.ttl"   # Turtle file written at the end of the run
 log_level      = "INFO"                  # DEBUG | INFO | WARNING
@@ -107,8 +106,6 @@ The agent logs each step and tool call to stderr:
 11:32:40 INFO     Batch 1 done — chunks 5/120 processed, 6 classes, 3 object properties, 0 individuals.
 …
 11:58:02 INFO     Deduplication: 4 candidate pairs above 0.90.
-11:59:30 INFO     Consistency check: 3 issues, 1 orphans — asking the LLM to fix them.
-12:01:12 INFO     Consistency check after fixes: 0 issues left.
 12:01:13 INFO     Ontology exported to ontology_output.ttl
 12:01:13 INFO     Finished — 84 classes, 41 object properties, 0 datatype properties, 23 individuals; chunks 120/120 processed.
 ```

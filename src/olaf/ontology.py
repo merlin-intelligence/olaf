@@ -507,6 +507,14 @@ class OntologyStore:
         DELETE {{ GRAPH <{graph}> {{ <{merge_uri}> ?p ?o }} }}
         WHERE  {{ GRAPH <{graph}> {{ <{merge_uri}> ?p ?o }} }}
         """)
+        # A relation between the two merged concepts (e.g. merge_uri subClassOf keep_uri)
+        # has become a self-loop on keep_uri: drop it, it would read as a subclass cycle
+        # or, for an object property, punning that types keep_uri against its range.
+        await self._ex.execute_update(f"""
+        {_PREFIXES}
+        DELETE {{ GRAPH <{graph}> {{ <{keep_uri}> ?p <{keep_uri}> }} }}
+        WHERE  {{ GRAPH <{graph}> {{ <{keep_uri}> ?p <{keep_uri}> }} }}
+        """)
 
     async def concept_list(self, ontology_id: str, root_only: bool = False, limit: int = 100) -> list[dict]:
         root_filter = ""

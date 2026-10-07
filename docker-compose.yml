@@ -10,8 +10,11 @@ services:
 
   olaf:
     build: .
-    ports:
-      - "8000:8000"
+    # Host networking: lets this container reach services bound to the host's
+    # 127.0.0.1 (e.g. a Qdrant instance listening only on loopback) — `ports` and
+    # `extra_hosts` are then ignored/unneeded. Requires config.toml to use
+    # localhost instead of service names (e.g. [oxigraph].url = "http://localhost:7878").
+    network_mode: host
     environment:
       MCP_TRANSPORT: sse
       MCP_HOST: "0.0.0.0"
@@ -19,8 +22,6 @@ services:
     volumes:
       - ./config.toml:/app/config.toml:ro
       - olaf_models:/models            # embedding model cache (downloaded once)
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     depends_on:
       - oxigraph
     restart: unless-stopped
