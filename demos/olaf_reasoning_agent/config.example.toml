@@ -1,0 +1,81 @@
+# olaf_reasoning_agent — example configuration
+# Copy to config.toml and fill in your values.
+
+[olaf]
+# URL of the running OLAF MCP server (SSE endpoint)
+url = "http://localhost:8000/sse"
+
+# Ontology to repair — it must already exist (built by olaf_building_agent, for instance)
+ontology_id = "demo"
+
+# Qdrant collection holding the chunks the ontology was built from: their text is given to the
+# LLM as evidence for each fix (default: the server's [qdrant].collection)
+collection = "chunks"
+
+# Optional — payload field names, if this collection differs from the server's [qdrant.field_mapping]
+# [olaf.field_mapping]
+# text        = "text"
+# doc_id      = "doc_id"
+# chunk_index = "chunk_index"
+
+
+[litellm]
+# Any model supported by LiteLLM — change the string to switch providers:
+#   Anthropic : "claude-sonnet-4-6"  → set ANTHROPIC_API_KEY
+#   OpenAI    : "gpt-4o"             → set OPENAI_API_KEY
+#   Ollama    : "ollama/llama3"       → no key needed, set OLLAMA_API_BASE if non-default
+#   Scaleway  : "openai/<model>"      → OpenAI-compatible: set api_base + api_key_env below
+model       = "claude-sonnet-4-6"
+max_tokens  = 4096
+temperature = 0
+
+# Seconds per LLM call before giving up. Raise this for reasoning models (e.g. ones that
+# "think" before answering) which can take a while to produce a large max_tokens response.
+timeout = 120
+
+# Retries when the provider answers 429 (rate limit / tokens-per-minute quota),
+# waiting 15s, 30s, then 60s between attempts.
+rate_limit_retries = 6
+
+# Retries when a call times out, cannot connect, or gets a 5xx error (10s pause each).
+transient_retries = 2
+
+# Optional — custom endpoint for OpenAI-compatible providers (Scaleway, vLLM…).
+# api_key_env is the NAME of the env var holding the key (the key itself stays out of the file).
+# api_base    = "https://api.scaleway.ai/v1"
+# api_key_env = "SCW_SECRET_KEY"
+
+
+[agent]
+# Check → fix → check again, for up to this many rounds. The run also stops as soon as nothing
+# is left, or when a round changed nothing. Several rounds are often needed: the reasoner only
+# lists unsatisfiable classes once the ontology is consistent.
+max_rounds = 3
+
+# Problems handed to each LLM conversation, with their context (axioms, entities, source text)
+problems_per_task = 5
+
+# Also connect orphan classes/individuals (no relation to the rest of the ontology)
+fix_orphans = true
+
+# Reason over the seed ontologies too (slower; finds conflicts between the ontology and its seeds)
+include_seeds = false
+
+# Max LLM ↔ tool rounds per task — the context is given upfront, searches are for what it misses
+max_iterations = 12
+
+# ── Context given with each task ──
+max_source_chunks     = 8      # source chunks per task (those of the axioms at stake first)
+max_chunk_chars       = 2500   # each chunk's text is cut beyond this
+max_entities_per_task = 25     # entities described (label, definition, types, ancestors, domain/range)
+
+# ── Context pruning (within a task) ──
+max_tool_result_chars = 20000  # a single tool result is truncated beyond this
+keep_recent_turns     = 6      # the last N LLM turns keep their full tool results
+pruned_result_chars   = 500    # older tool results are cut to this preview
+
+# ── Output ──
+# A Turtle backup of the ontology is written here before the first change (empty = no backup)
+backup_dir = "backups"
+# export_path = "ontology_repaired.ttl"   # Turtle export written at the end (optional)
+log_level = "INFO"                        # DEBUG | INFO | WARNING

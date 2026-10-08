@@ -507,6 +507,14 @@ class OntologyStore:
         DELETE {{ GRAPH <{graph}> {{ <{merge_uri}> ?p ?o }} }}
         WHERE  {{ GRAPH <{graph}> {{ <{merge_uri}> ?p ?o }} }}
         """)
+        # A relation between the two merged concepts (e.g. merge_uri subClassOf keep_uri)
+        # has become a self-loop on keep_uri: drop it, it would read as a subclass cycle
+        # or, for an object property, punning that types keep_uri against its range.
+        await self._ex.execute_update(f"""
+        {_PREFIXES}
+        DELETE {{ GRAPH <{graph}> {{ <{keep_uri}> ?p <{keep_uri}> }} }}
+        WHERE  {{ GRAPH <{graph}> {{ <{keep_uri}> ?p <{keep_uri}> }} }}
+        """)
 
     async def concept_list(self, ontology_id: str, root_only: bool = False, limit: int = 100) -> list[dict]:
         root_filter = ""
@@ -978,6 +986,49 @@ class OntologyStore:
             """)
         return bnode
 
+    # ── Disjointness ──────────────────────────────────────────────────────
+
+    async def disjoint_add(self, ontology_id: str, class_uris: list[str]) -> dict:
+        """Declare the given classes pairwise disjoint (owl:disjointWith, one direction
+        per pair so a single relation_delete undoes it)."""
+        uris = list(dict.fromkeys(_check_uri(u) for u in class_uris))
+        if len(uris) < 2:
+            raise ValueError("disjoint_add needs at least 2 distinct class URIs.")
+        graph = self._graph(ontology_id)
+        base = await self._resolve_base(ontology_id)
+        for uri in uris:
+            await self._require_existing(graph, base, uri)
+            if uri.startswith(base) and not await self._ex.execute_ask(
+                f"{_PREFIXES}\nASK {{ GRAPH <{graph}> {{ <{uri}> a owl:Class }} }}"
+            ):
+                raise ValueError(f"Not an owl:Class: {uri!r}. Disjointness only applies to classes.")
+
+        pairs = [(a, b) for i, a in enumerate(uris) for b in uris[i + 1:]]
+        for a, b in pairs:
+            # A class disjoint with one of its own ancestors is unsatisfiable by construction.
+            if await self._ex.execute_ask(f"""
+            {_PREFIXES}
+            ASK {{ GRAPH <{graph}> {{ {{ <{a}> rdfs:subClassOf+ <{b}> }} UNION {{ <{b}> rdfs:subClassOf+ <{a}> }} }} }}
+            """):
+                raise ValueError(
+                    f"{a!r} and {b!r} are in a subclass relation: declaring them disjoint would make "
+                    "the subclass empty. Only declare disjointness between classes that cannot share instances."
+                )
+
+        added = 0
+        for a, b in pairs:
+            if await self._ex.execute_ask(f"""
+            {_PREFIXES}
+            ASK {{ GRAPH <{graph}> {{ {{ <{a}> owl:disjointWith <{b}> }} UNION {{ <{b}> owl:disjointWith <{a}> }} }} }}
+            """):
+                continue
+            await self._ex.execute_update(f"""
+            {_PREFIXES}
+            INSERT DATA {{ GRAPH <{graph}> {{ <{a}> owl:disjointWith <{b}> }} }}
+            """)
+            added += 1
+        return {"pairs_added": added, "pairs_existing": len(pairs) - added}
+
     # ── Validation ────────────────────────────────────────────────────────
 
     async def orphans(self, ontology_id: str, limit: int = 100) -> list[dict]:
@@ -1006,6 +1057,103 @@ class OntologyStore:
             {"uri": row["e"] or "", "label": row["label"] or "", "kind": row["kind"] or ""}
             for row in rows
         ]
+
+    async def integrity_checks(self, ontology_id: str, limit: int = 50) -> dict:
+        """Closed-world checks the OWL reasoner does not report: under OWL semantics
+        rdfs:domain/range only *infer* types (and a relation between two classes is
+        punning, not constrained at all), and subclass cycles silently mean equivalence."""
+        graph = self._graph(ontology_id)
+        # Subject/object "conforms" to class ?c if it is an instance of ?c or a subclass of
+        # ?c (relations between classes read as "every X relates to some Y").
+        conforms = "(rdf:type|rdfs:subClassOf)/rdfs:subClassOf*"
+
+        cycles = await self._ex.execute_select(f"""
+        {_PREFIXES}
+        SELECT DISTINCT ?c WHERE {{
+            GRAPH <{graph}> {{ ?c a owl:Class . ?c rdfs:subClassOf+ ?c }}
+        }}
+        LIMIT {limit}
+        """, ["c"])
+
+        untyped = await self._ex.execute_select(f"""
+        {_PREFIXES}
+        SELECT ?i WHERE {{
+            GRAPH <{graph}> {{
+                ?i a owl:NamedIndividual .
+                FILTER NOT EXISTS {{ ?i a ?t . FILTER(?t NOT IN (owl:NamedIndividual, owl:Thing)) }}
+            }}
+        }}
+        LIMIT {limit}
+        """, ["i"])
+
+        domain = await self._ex.execute_select(f"""
+        {_PREFIXES}
+        SELECT ?s ?p ?o ?expected WHERE {{
+            GRAPH <{graph}> {{
+                ?p rdfs:domain ?expected .
+                FILTER(isIRI(?expected))
+                ?s ?p ?o .
+                FILTER(?s != ?expected)
+                FILTER NOT EXISTS {{ ?s {conforms} ?expected }}
+            }}
+        }}
+        LIMIT {limit}
+        """, ["s", "p", "o", "expected"])
+
+        obj_range = await self._ex.execute_select(f"""
+        {_PREFIXES}
+        SELECT ?s ?p ?o ?expected WHERE {{
+            GRAPH <{graph}> {{
+                ?p a owl:ObjectProperty ; rdfs:range ?expected .
+                FILTER(isIRI(?expected))
+                ?s ?p ?o .
+                FILTER(isIRI(?o) && ?o != ?expected)
+                FILTER NOT EXISTS {{ ?o {conforms} ?expected }}
+            }}
+        }}
+        LIMIT {limit}
+        """, ["s", "p", "o", "expected"])
+
+        data_range = await self._ex.execute_select(f"""
+        {_PREFIXES}
+        SELECT ?s ?p ?o ?expected WHERE {{
+            GRAPH <{graph}> {{
+                ?p a owl:DatatypeProperty ; rdfs:range ?expected .
+                FILTER(isIRI(?expected) && ?expected != rdfs:Literal)
+                ?s ?p ?o .
+                FILTER(isLiteral(?o) && DATATYPE(?o) != ?expected)
+            }}
+        }}
+        LIMIT {limit}
+        """, ["s", "p", "o", "expected"])
+
+        kind = await self._ex.execute_select(f"""
+        {_PREFIXES}
+        SELECT ?s ?p ?o ?problem WHERE {{
+            GRAPH <{graph}> {{
+                {{ ?p a owl:ObjectProperty . ?s ?p ?o . FILTER(isLiteral(?o))
+                   BIND("object property used with a literal value" AS ?problem) }}
+                UNION
+                {{ ?p a owl:DatatypeProperty . ?s ?p ?o . FILTER(!isLiteral(?o))
+                   BIND("datatype property used with a URI value" AS ?problem) }}
+            }}
+        }}
+        LIMIT {limit}
+        """, ["s", "p", "o", "problem"])
+
+        def triples(rows: list[dict], extra: str) -> list[dict]:
+            return [
+                {"subject": r["s"] or "", "property": r["p"] or "", "object": r["o"] or "", extra: r[extra] or ""}
+                for r in rows
+            ]
+
+        return {
+            "subclass_cycles": [r["c"] or "" for r in cycles],
+            "untyped_individuals": [r["i"] or "" for r in untyped],
+            "domain_violations": triples(domain, "expected"),
+            "range_violations": triples(obj_range, "expected") + triples(data_range, "expected"),
+            "property_kind_mismatches": triples(kind, "problem"),
+        }
 
     # ── Seeds ─────────────────────────────────────────────────────────────
 
@@ -1093,6 +1241,25 @@ class OntologyStore:
                     result += f"\n# Seed graph: {g}\n" + (await self._ex.dump_graph(g)).decode()
 
         return result
+
+    async def reasoner_input(self, ontology_id: str, include_seeds: bool = False) -> bytes:
+        """The ontology's logical content as N-Triples, for the reasoner: provenance
+        (extractedFrom, rdf:Statement reification nodes) is dropped, and so are
+        owl:imports, which would make the reasoner fetch ontologies over the network."""
+        graph = self._graph(ontology_id)
+        graph_filter = f"?g = <{graph}>"
+        if include_seeds:
+            graph_filter += ' || STRSTARTS(STR(?g), "urn:olaf:seed:")'
+        resp = await self._ex.execute_raw_query(f"""
+        {_PREFIXES}
+        CONSTRUCT {{ ?s ?p ?o }} WHERE {{
+            GRAPH ?g {{ ?s ?p ?o }}
+            FILTER({graph_filter})
+            FILTER(?p NOT IN (<urn:olaf:extractedFrom>, owl:imports))
+            FILTER(!STRSTARTS(STR(?s), "urn:olaf:stmt:"))
+        }}
+        """, "application/n-triples")
+        return resp.content
 
     # ── Summary ───────────────────────────────────────────────────────────
 

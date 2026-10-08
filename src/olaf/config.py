@@ -35,8 +35,16 @@ class OntologyConfig:
 
 @dataclass
 class EmbeddingConfig:
-    model: str = "intfloat/multilingual-e5-base"
+    model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     enabled: bool = True
+
+
+@dataclass
+class ReasonerConfig:
+    enabled: bool = True
+    java: str = "java"
+    memory_mb: int = 2048
+    timeout_seconds: int = 120
 
 
 @dataclass
@@ -45,6 +53,7 @@ class Config:
     oxigraph: OxigraphConfig = field(default_factory=OxigraphConfig)
     ontology: OntologyConfig = field(default_factory=OntologyConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
+    reasoner: ReasonerConfig = field(default_factory=ReasonerConfig)
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Config":
@@ -84,6 +93,12 @@ class Config:
         if e := data.get("embedding"):
             cfg.embedding.model = e.get("model", cfg.embedding.model)
             cfg.embedding.enabled = e.get("enabled", cfg.embedding.enabled)
+
+        if r := data.get("reasoner"):
+            cfg.reasoner.enabled = r.get("enabled", cfg.reasoner.enabled)
+            cfg.reasoner.java = r.get("java", cfg.reasoner.java)
+            cfg.reasoner.memory_mb = r.get("memory_mb", cfg.reasoner.memory_mb)
+            cfg.reasoner.timeout_seconds = r.get("timeout_seconds", cfg.reasoner.timeout_seconds)
 
         cfg.qdrant.api_key = os.environ.get("QDRANT_API_KEY", cfg.qdrant.api_key)
 

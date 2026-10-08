@@ -20,7 +20,7 @@ For each question the agent runs a tool loop, capped at `max_iterations` rounds:
 4. **Ground** the answer by following provenance (`urn:olaf:extractedFrom`) back to the chunks and reading them with `chunk_read_batch`.
 5. **Answer** in the language of the question, citing concepts and chunks (`[chunk <id>, doc <doc_id>]`).
 
-The conversation is kept between questions, so follow-ups such as "and which of those are in France?" work.
+The conversation is kept between questions, so follow-ups such as "and which of those are in France?" work. To keep the context small, tool results older than the last `keep_recent_turns` LLM turns are cut to a short preview; the LLM re-runs a tool if it needs the full result again.
 
 ### Read-only access
 
@@ -47,6 +47,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 [olaf]
 url         = "http://localhost:8000/sse"   # OLAF SSE endpoint
 ontology_id = "demo"                        # ontology to search
+collection  = "chunks"                      # collection it was built from (default: server's)
 
 [litellm]
 model       = "claude-sonnet-4-6"
@@ -56,6 +57,8 @@ temperature = 0
 [agent]
 max_iterations        = 20     # LLM ↔ tool rounds per question, then a forced final answer
 max_tool_result_chars = 20000  # truncate large tool results before sending them to the LLM
+keep_recent_turns     = 4      # older tool results are cut to a preview of…
+pruned_result_chars   = 500    # …this many characters
 show_sparql           = true   # print generated SPARQL to stderr
 log_level             = "INFO"
 ```
@@ -74,6 +77,10 @@ api_key_env = "SCW_SECRET_KEY"
 ```bash
 export SCW_SECRET_KEY=...   # IAM API key secret
 ```
+
+The agent does not read `.env` files: export the variable in the shell that runs it.
+
+When the provider answers HTTP 429 (rate limit), the call is retried after 15 s, 30 s, then 60 s, up to `[litellm] rate_limit_retries` times (default 6).
 
 ## Running
 

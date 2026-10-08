@@ -22,6 +22,18 @@ wheels/
 .coverage
 htmlcov/
 config.toml
+config.local.toml
 .env
+.env.*
 venv/
 .venv/
+
+# Logs
+*.log
+
+# Local test artifacts
+demos/olaf_building_agent/climate_fund/
+demos/olaf_reasoning_agent/backups/
+
+# OS/editor
+.DS_Store

@@ -13,14 +13,15 @@
 # └─────────────────────────────────────────────────────────────────┘
 
 # ── Qdrant ─────────────────────────────────────────────────────────────────────
-# Connection to the existing chunk collection (read + status tracking).
-# These settings are shared by all connected agents.
+# Connection to Qdrant (chunk reading + status tracking). The connection is shared by
+# all connected agents; each agent picks its chunk collection in its own config
+# (chunk_collection_switch), `collection` / `field_mapping` below are only the defaults.
 
 [qdrant]
 url                 = "http://localhost:6333"
 # api_key             = "..."           # required if Qdrant has auth enabled
                                          # (or set the QDRANT_API_KEY env var, which takes precedence)
-collection          = "chunks"          # your existing chunk collection
+collection          = "chunks"          # default chunk collection (agents can switch)
 concepts_collection = "olaf_concepts"   # prefix — actual: olaf_concepts_{ontology_id}
 
 [qdrant.field_mapping]
@@ -51,5 +52,22 @@ ontology_id  = "main"                          # default named graph (urn:olaf:m
 # Disable if you don't need semantic dedup (reduces memory usage).
 
 [embedding]
-model   = "intfloat/multilingual-e5-small"   # downloaded automatically via fastembed
+model   = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# Any model fastembed supports (TextEmbedding.list_supported_models()), plus
+# "intfloat/multilingual-e5-small" (384 d) and "intfloat/multilingual-e5-base" (768 d),
+# loaded from their ONNX export on Hugging Face (~0.5 GB / ~1.1 GB, downloaded on first start).
+# Concepts are indexed when they are created, and an existing index is not recomputed when
+# the model changes (vector sizes differ): after changing it, build into a new ontology_id.
 enabled = true
+
+# ── Reasoner ───────────────────────────────────────────────────────────────────
+# Powers ontology_check (OWL 2 DL consistency + unsatisfiable classes, with
+# explanations). Uses the Pellet jars bundled with owlready2; requires Java 11+
+# (installed in the Docker image). When disabled or when Java is missing,
+# ontology_check still runs its SPARQL integrity checks.
+
+[reasoner]
+enabled         = true
+java            = "java"   # path to the java executable
+memory_mb       = 2048     # JVM max heap (-Xmx)
+timeout_seconds = 120      # per reasoner call

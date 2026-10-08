@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import sys
+import time
 import tomllib
 
 import litellm
@@ -84,6 +85,8 @@ class SearchingAgent:
         agent_cfg = config.get("agent", {})
         self.max_iterations = agent_cfg.get("max_iterations", 20)
         self.max_tool_result_chars = agent_cfg.get("max_tool_result_chars", 20_000)
+        self.keep_recent_turns = agent_cfg.get("keep_recent_turns", 4)
+        self.pruned_result_chars = agent_cfg.get("pruned_result_chars", 500)
         self.show_sparql = show_sparql
         self.tools = tools
         self.system_prompt = build_system_prompt(config["olaf"]["ontology_id"])
@@ -94,15 +97,15 @@ class SearchingAgent:
 
     async def _complete(self, tool_choice: str = "auto"):
         return await asyncio.to_thread(
-            litellm.completion,
+            _completion,
+            self.llm_cfg,
             model=self.llm_cfg["model"],
-            messages=self.messages,
+            messages=prune_history(self.messages, self.keep_recent_turns, self.pruned_result_chars),
             tools=self.tools,
             tool_choice=tool_choice,
             max_tokens=self.llm_cfg.get("max_tokens", 4096),
             temperature=self.llm_cfg.get("temperature", 0),
-            timeout=120,
-            **_endpoint_kwargs(self.llm_cfg),
+            timeout=self.llm_cfg.get("timeout", 120),
         )
 
     async def ask(self, question: str) -> str:
@@ -186,6 +189,37 @@ class SearchingAgent:
         return content
 
 
+# ─── Context pruning ──────────────────────────────────────────────────────────
+
+
+def prune_history(
+    messages: list[dict], keep_recent_turns: int, pruned_chars: int, max_turns: int | None = None
+) -> list[dict]:
+    """Copy of `messages` to send to the LLM. A turn is an assistant message with tool calls
+    plus its tool results. Tool results older than the last `keep_recent_turns` turns are cut
+    to a `pruned_chars` preview; with `max_turns`, turns beyond it are dropped altogether
+    (oldest first, the leading system/user messages are kept). Whole turns are always kept or
+    dropped together, so every tool call keeps its result, as the API requires."""
+    starts = [i for i, m in enumerate(messages) if m["role"] == "assistant" and m.get("tool_calls")]
+    if max_turns is not None and len(starts) > max_turns:
+        head_end, first_kept = starts[0], starts[-max_turns]
+        messages = messages[:head_end] + messages[first_kept:]
+        starts = [s - (first_kept - head_end) for s in starts[-max_turns:]]
+
+    keep = max(1, keep_recent_turns)
+    cutoff = starts[-keep] if len(starts) > keep else 0
+    pruned = []
+    for i, m in enumerate(messages):
+        content = m.get("content") or ""
+        if i < cutoff and m["role"] == "tool" and len(content) > pruned_chars:
+            m = {**m, "content": (
+                content[:pruned_chars]
+                + f"\n… [pruned from context: {len(content)} chars — call the tool again if you need it]"
+            )}
+        pruned.append(m)
+    return pruned
+
+
 def _endpoint_kwargs(llm_cfg: dict) -> dict:
     """Optional custom endpoint for OpenAI-compatible providers (Scaleway, vLLM, …).
     The key is read from the env var named by api_key_env, never stored in the config."""
@@ -198,6 +232,44 @@ def _endpoint_kwargs(llm_cfg: dict) -> dict:
             raise SystemExit(f"Environment variable {llm_cfg['api_key_env']} is not set.")
         kwargs["api_key"] = key
     return kwargs
+
+
+# Errors worth retrying as-is: the provider was slow or briefly unavailable.
+_TRANSIENT_ERRORS = (
+    litellm.Timeout,
+    litellm.APIConnectionError,
+    litellm.InternalServerError,
+    litellm.ServiceUnavailableError,
+)
+
+
+def _completion(llm_cfg: dict, **kwargs):
+    """litellm.completion, retried on rate limits (HTTP 429) with a growing wait — quotas
+    are usually per minute, so the wait goes up to a full minute — and on transient errors
+    (timeout, connection, 5xx), which are retried a few times after a short pause."""
+    rate_limit_retries = llm_cfg.get("rate_limit_retries", 6)
+    transient_retries = llm_cfg.get("transient_retries", 2)
+    rate_limited = transient = 0
+    while True:
+        try:
+            return litellm.completion(**kwargs, **_endpoint_kwargs(llm_cfg))
+        except litellm.RateLimitError:
+            if rate_limited == rate_limit_retries:
+                raise
+            wait = min(15 * 2 ** rate_limited, 60)
+            rate_limited += 1
+            logger.warning(
+                "Rate limited by the LLM provider — retrying in %ds (%d/%d).", wait, rate_limited, rate_limit_retries
+            )
+            time.sleep(wait)
+        except _TRANSIENT_ERRORS as exc:
+            if transient == transient_retries:
+                raise
+            transient += 1
+            logger.warning(
+                "LLM call failed (%s) — retrying in 10s (%d/%d).", type(exc).__name__, transient, transient_retries
+            )
+            time.sleep(10)
 
 
 def _summarise(args: dict) -> str:
@@ -258,6 +330,17 @@ async def main_async(config: dict, question: str | None, show_sparql: bool) -> N
                 raise SystemExit(f"Cannot use ontology '{ontology_id}': {switch_text}")
             logger.info("Active ontology: %s", ontology_id)
 
+            # Source chunks must be read from the collection the ontology was built from.
+            if collection := config["olaf"].get("collection"):
+                args: dict = {"collection": collection}
+                if config["olaf"].get("field_mapping"):
+                    args["field_mapping"] = config["olaf"]["field_mapping"]
+                switch = await session.call_tool("chunk_collection_switch", args)
+                switch_text = switch.content[0].text if switch.content else ""
+                if switch_text.startswith("Error"):
+                    raise SystemExit(f"Cannot use collection '{collection}': {switch_text}")
+                logger.info("Chunk collection: %s", collection)
+
             tools_result = await session.list_tools()
             read_only = [t for t in tools_result.tools if t.name in READ_ONLY_TOOLS]
             missing = READ_ONLY_TOOLS - {t.name for t in read_only}
@@ -270,6 +353,26 @@ async def main_async(config: dict, question: str | None, show_sparql: bool) -> N
                 print(await agent.ask(question))
             else:
                 await interactive_loop(agent)
+
+
+def _run(coro) -> None:
+    """asyncio.run, but a SystemExit raised inside the MCP session (wrapped by anyio in an
+    exception group) exits with its message instead of a long traceback."""
+    def first_exit(group: BaseExceptionGroup) -> SystemExit | None:
+        for exc in group.exceptions:
+            found = exc if isinstance(exc, SystemExit) else (
+                first_exit(exc) if isinstance(exc, BaseExceptionGroup) else None
+            )
+            if found:
+                return found
+        return None
+
+    try:
+        asyncio.run(coro)
+    except BaseExceptionGroup as group:
+        if exit_exc := first_exit(group):
+            raise exit_exc from None
+        raise
 
 
 def main() -> None:
@@ -298,7 +401,7 @@ def main() -> None:
     )
     show_sparql = args.show_sparql if args.show_sparql is not None else agent_cfg.get("show_sparql", True)
 
-    asyncio.run(main_async(config, args.question, show_sparql))
+    _run(main_async(config, args.question, show_sparql))
 
 
 if __name__ == "__main__":

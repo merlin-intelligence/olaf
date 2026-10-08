@@ -9,8 +9,17 @@ url = "http://localhost:8000/sse"
 ontology_id  = "demo"
 ontology_name = "Demo Ontology"
 
-# Namespace for generated URIs — must match the OLAF server config.toml [ontology].base_uri
+# Namespace for generated URIs (used when the ontology is created)
 base_uri = "http://olaf.local/ontology#"
+
+# Qdrant collection holding the chunks to process (default: the server's [qdrant].collection)
+collection = "chunks"
+
+# Optional — payload field names, if this collection differs from the server's [qdrant.field_mapping]
+# [olaf.field_mapping]
+# text        = "text"
+# doc_id      = "doc_id"
+# chunk_index = "chunk_index"
 
 
 [litellm]
@@ -19,25 +28,60 @@ base_uri = "http://olaf.local/ontology#"
 #   OpenAI    : "gpt-4o"             → set OPENAI_API_KEY
 #   Azure     : "azure/gpt-4o"       → set AZURE_API_KEY, AZURE_API_BASE
 #   Ollama    : "ollama/llama3"       → no key needed, set OLLAMA_API_BASE if non-default
+#   Scaleway  : "openai/<model>"      → OpenAI-compatible: set api_base + api_key_env below
 model       = "claude-sonnet-4-6"
 max_tokens  = 4096
 temperature = 0       # 0 = deterministic output, best for structured extraction
 
+# Seconds per LLM call before giving up. Raise this for reasoning models (e.g. ones that
+# "think" before answering) which can take a while to produce a large max_tokens response.
+timeout = 120
+
+# Retries when the provider answers 429 (rate limit / tokens-per-minute quota),
+# waiting 15s, 30s, then 60s between attempts.
+rate_limit_retries = 6
+
+# Retries when a call times out, cannot connect, or gets a 5xx error (10s pause each).
+transient_retries = 2
+
+# Optional — custom endpoint for OpenAI-compatible providers (Scaleway, vLLM…).
+# api_key_env is the NAME of the env var holding the key (the key itself stays out of the file).
+# Example for Scaleway Generative APIs:
+#   model       = "openai/llama-3.3-70b-instruct"
+#   api_base    = "https://api.scaleway.ai/v1"
+#   api_key_env = "SCW_SECRET_KEY"
+# api_base    = ""
+# api_key_env = ""
+
 
 [agent]
-# Number of chunks to feed to the LLM in a single extraction call.
-# Larger batches = fewer LLM calls but larger prompts. 3–8 is usually a good range.
-batch_size  = 5
+# ── Phase 1: extraction ──
+# Pending chunks are processed by batches; each batch is a fresh LLM conversation that gets
+# the chunks plus a digest of the current ontology. The pipeline marks them processed after.
+batch_size  = 5      # chunks per batch — larger = fewer LLM calls but bigger prompts (3–8 is usually good)
+max_batches = 0      # stop after N batches (0 = process all pending chunks) — handy for quick trials
 
-# Maximum number of batches to process (0 = no limit, process all pending chunks)
-max_batches = 0
+# Max classes / properties / seed classes listed in each batch's ontology digest
+# (the LLM finds the others with concept_search / property_search).
+digest_max_entries = 150
 
-# Run a semantic deduplication pass at the end to detect and merge near-duplicate concepts.
-# Adds ~1 LLM call if duplicates are found.
-consolidate = true
+# Max LLM ↔ tool rounds per task (a batch, a dedup group)
+max_iterations = 30
 
-# Output file for the final Turtle export
-export_path = "ontology_output.ttl"
+# ── Phase 2: consolidation ──
+# After extraction: near-duplicate classes (concept embeddings) are reviewed by the LLM
+# (merge or keep). No LLM call when there are no candidates.
+# Logical problems (reasoner, integrity checks, orphans) are repaired by olaf_reasoning_agent.
+consolidate          = true
+dedup_threshold      = 0.9   # min semantic similarity for a pair of classes to be reviewed
+dedup_pairs_per_task = 20    # candidate pairs reviewed per LLM conversation
 
-# Log verbosity: DEBUG | INFO | WARNING
-log_level = "INFO"
+# ── Context pruning (within a task) ──
+max_tool_result_chars = 20000   # a single tool result is truncated beyond this
+keep_recent_turns     = 3       # the last N LLM turns keep their full tool results
+pruned_result_chars   = 500     # older tool results are cut to this preview
+max_history_turns     = 20      # turns beyond this are dropped from the context (oldest first)
+
+# ── Output ──
+export_path = "ontology_output.ttl"   # Turtle export written at the end of the run
+log_level   = "INFO"                  # DEBUG | INFO | WARNING
