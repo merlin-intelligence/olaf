@@ -4,6 +4,7 @@ import importlib.util
 import os
 import re
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # Pellet 2.3.1 (with its explanation module) ships inside the owlready2 wheel. It is
@@ -20,6 +21,17 @@ _BUILTIN_NAMESPACES = (
     "http://www.w3.org/2000/01/rdf-schema#",
     "http://www.w3.org/2002/07/owl#",
     "http://www.w3.org/2001/XMLSchema#",
+)
+_RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+_RDF_TYPE = _RDF + "type"
+_SUBCLASS_OF = "http://www.w3.org/2000/01/rdf-schema#subClassOf"
+_NT_TRIPLE = re.compile(r"^<([^>]+)> <([^>]+)> <([^>]+)> \.\s*$")
+
+# Entailments `pellet extract` computes. Direct* variants would only give back the asserted
+# hierarchy; these include what follows from it and from domains, ranges, equivalences,
+# restrictions and property axioms.
+_EXTRACT_STATEMENTS = (
+    "SubClassOf EquivalentClasses SubPropertyOf ClassAssertion ObjectPropertyAssertion SameIndividual"
 )
 
 
@@ -48,6 +60,61 @@ def _local_index(ntriples: bytes) -> dict[str, list[str]]:
     return {k: sorted(v) for k, v in index.items()}
 
 
+def _parse_extract(rdfxml: str, ntriples: bytes) -> list[tuple[str, str, str]]:
+    """New entailments in `pellet extract`'s RDF/XML output, as (subject, predicate, object)
+    IRIs: what is already asserted, trivial (X ⊑ X, X ⊑ owl:Thing, X a owl:Class…), about
+    built-in terms, or about literals and blank nodes is left out. So is the type a class
+    receives when used as an individual (punning: a relation between two classes gives its
+    subject the property's domain) — it says nothing about the class's instances."""
+    asserted: set[tuple[str, str, str]] = set()
+    terms: set[str] = set()  # classes and properties, as declared in the input
+    for line in ntriples.decode(errors="replace").splitlines():
+        if m := _NT_TRIPLE.match(line):
+            asserted.add(m.groups())
+            if m.group(2) == _RDF_TYPE and m.group(3).startswith("http://www.w3.org/2002/07/owl#") and \
+                    m.group(3).rsplit("#", 1)[1] in ("Class", "ObjectProperty", "DatatypeProperty"):
+                terms.add(m.group(1))
+
+    about, resource = f"{{{_RDF}}}about", f"{{{_RDF}}}resource"
+    found: set[tuple[str, str, str]] = set()
+    for node in ET.fromstring(rdfxml):
+        subject = node.get(about)
+        if not subject or subject.startswith(_BUILTIN_NAMESPACES):
+            continue
+        statements = [(child.tag[1:].replace("}", ""), child.get(resource)) for child in node]
+        if node.tag != f"{{{_RDF}}}Description":  # typed node: <owl:Class rdf:about=…>
+            statements.append((_RDF_TYPE, node.tag[1:].replace("}", "")))
+        for predicate, obj in statements:
+            if not obj or obj == subject or obj.startswith(_BUILTIN_NAMESPACES):
+                continue
+            if predicate == _RDF_TYPE and subject in terms:
+                continue
+            if (subject, predicate, obj) not in asserted:
+                found.add((subject, predicate, obj))
+    return sorted(found)
+
+
+def _taxonomic_chain(edges: dict[str, dict[str, list[str]]], s: str, p: str, o: str) -> list[str] | None:
+    """Shortest chain of asserted rdf:type / rdfs:subClassOf axioms from which `s p o`
+    follows, in Pellet's notation ("A subClassOf B", "i type C"), or None if there is none.
+    `edges[predicate][subject]` lists the asserted objects."""
+    if p not in (_RDF_TYPE, _SUBCLASS_OF):
+        return None
+    start = [(c, [f"{_local_name(s)} {'type' if p == _RDF_TYPE else 'subClassOf'} {_local_name(c)}"])
+             for c in edges[p].get(s, [])]
+    seen, queue = {s}, list(start)
+    while queue:
+        node, chain = queue.pop(0)
+        if node == o:
+            return chain
+        if node in seen:
+            continue
+        seen.add(node)
+        queue.extend((parent, chain + [f"{_local_name(node)} subClassOf {_local_name(parent)}"])
+                     for parent in edges[_SUBCLASS_OF].get(node, []))
+    return None
+
+
 def _parse_explanations(output: str) -> list[dict]:
     """Parse `pellet explain` output into [{axiom, explanations: [[axiom, ...], ...]}].
 
@@ -74,8 +141,9 @@ def _parse_explanations(output: str) -> list[dict]:
 
 
 class Reasoner:
-    """OWL 2 DL consistency / satisfiability checks with Pellet, with justifications
-    (the minimal set of axioms causing each problem)."""
+    """OWL 2 DL reasoning with Pellet: consistency / satisfiability checks and the
+    entailments of the ontology, each with its justification (the minimal set of axioms
+    causing a problem, or from which an entailment follows)."""
 
     def __init__(self, java: str = "java", memory_mb: int = 2048, timeout_seconds: int = 120):
         self._java = java
@@ -152,6 +220,69 @@ class Reasoner:
             "unsatisfiable_classes": unsat,
             "entities": self._entities(all_explanations, index),
         }
+
+    async def infer(self, ntriples: bytes) -> dict:
+        """New entailments of a consistent ontology: {consistent, inferences: [(s, p, o)]}.
+        Nothing is inferred from an inconsistent ontology (everything would follow)."""
+        with tempfile.TemporaryDirectory(prefix="olaf-reasoner-") as tmp:
+            path = str(Path(tmp) / "ontology.nt")
+            Path(path).write_bytes(ntriples)
+            if "Consistent: Yes" not in await self._pellet("consistency", path):
+                return {"consistent": False, "inferences": []}
+            output = await self._pellet("extract", "--statements", _EXTRACT_STATEMENTS, path)
+        return {"consistent": True, "inferences": _parse_extract(output, ntriples)}
+
+    async def explain_entailments(
+        self, ntriples: bytes, triples: list[tuple[str, str, str]], max_explanations: int = 1
+    ) -> list[dict]:
+        """Why each entailment holds: [{explanations, entities}] in the order of `triples`.
+        Pellet explains subclass and instance entailments only; others get no explanation."""
+        index = _local_index(ntriples)
+        out = []
+        with tempfile.TemporaryDirectory(prefix="olaf-reasoner-") as tmp:
+            path = str(Path(tmp) / "ontology.nt")
+            Path(path).write_bytes(ntriples)
+            for s, p, o in triples:
+                option = {_SUBCLASS_OF: "--subclass", _RDF_TYPE: "--instance"}.get(p)
+                if not option:
+                    out.append({"explanations": [], "entities": {}})
+                    continue
+                blocks = _parse_explanations(
+                    await self._pellet("explain", option, f"{s},{o}", "--max", str(max_explanations), path)
+                )
+                explanations = blocks[0]["explanations"] if blocks else []
+                out.append({"explanations": explanations, "entities": self._entities(explanations, index)})
+        return out
+
+    async def explain_inferences(
+        self, ntriples: bytes, triples: list[tuple[str, str, str]], max_explained: int = 20
+    ) -> list[dict]:
+        """Each entailment with why it holds. Those that follow from the asserted class
+        hierarchy alone (`taxonomic`) get their chain of rdf:type / rdfs:subClassOf axioms,
+        computed here; Pellet explains the others — the ones involving domains, ranges,
+        equivalences, restrictions… — up to `max_explained` (one JVM run each)."""
+        edges: dict[str, dict[str, list[str]]] = {_RDF_TYPE: {}, _SUBCLASS_OF: {}}
+        for line in ntriples.decode(errors="replace").splitlines():
+            if (m := _NT_TRIPLE.match(line)) and m.group(2) in edges and not m.group(3).startswith(_BUILTIN_NAMESPACES):
+                edges[m.group(2)].setdefault(m.group(1), []).append(m.group(3))
+        index = _local_index(ntriples)
+
+        items, to_explain = [], []
+        for s, p, o in triples:
+            chain = _taxonomic_chain(edges, s, p, o)
+            item = {"subject": s, "predicate": p, "object": o, "taxonomic": chain is not None,
+                    "explanations": [chain] if chain else [], "entities": {}}
+            if chain:
+                item["entities"] = self._entities(item["explanations"], index)
+            elif len(to_explain) < max_explained:
+                to_explain.append(item)
+            items.append(item)
+        explained = await self.explain_entailments(
+            ntriples, [(i["subject"], i["predicate"], i["object"]) for i in to_explain]
+        )
+        for item, e in zip(to_explain, explained):
+            item.update(e)
+        return items
 
     @staticmethod
     def _entities(explanations: list[list[str]], index: dict[str, list[str]]) -> dict:

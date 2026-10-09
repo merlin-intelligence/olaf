@@ -234,7 +234,8 @@ def create_server(
                 name="concept_get",
                 description=(
                     "Get all triples for a concept URI: type, label, definition, aliases, subClassOf, restrictions. "
-                    "Also returns source_chunk_ids: every chunk this concept was extracted from."
+                    "Also returns source_chunk_ids: every chunk this concept was extracted from, and, for a class "
+                    "with OWL restrictions, `restrictions` in restriction_add / restriction_delete terms."
                 ),
                 inputSchema={
                     "type": "object",
@@ -516,6 +517,43 @@ def create_server(
                 },
             ),
             types.Tool(
+                name="restriction_delete",
+                description=(
+                    "Delete OWL restrictions of a class on a property (the blank-node restrictions relation_delete "
+                    "cannot reach): all of them, or only those of a given restriction_type and/or value — the "
+                    "terms concept_get lists under `restrictions`. Returns how many were deleted."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "class_uri": {"type": "string"},
+                        "property_uri": {"type": "string"},
+                        "restriction_type": {
+                            "type": "string",
+                            "enum": ["some", "all", "has_value", "exactly", "min", "max"],
+                            "description": "Only restrictions of this type (default: any)",
+                        },
+                        "value": {"type": "string", "description": "Only restrictions on this class URI / literal (default: any)"},
+                        "is_literal_value": {"type": "boolean", "description": "True if value is a literal (has_value)"},
+                    },
+                    "required": ["class_uri", "property_uri"],
+                },
+            ),
+            types.Tool(
+                name="entity_delete",
+                description=(
+                    "Delete a class, individual or property of the ontology entirely: every triple it appears in "
+                    "(as subject, property or object), their provenance, its restrictions and the restrictions "
+                    "pointing to it, and its entry in the semantic index. For a wrong or spurious entity only — "
+                    "to fix one relation use relation_delete, for a duplicate use concept_merge. Irreversible."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {"uri": {"type": "string", "description": "URI of the entity to delete"}},
+                    "required": ["uri"],
+                },
+            ),
+            types.Tool(
                 name="disjoint_add",
                 description=(
                     "Declare classes pairwise disjoint (owl:disjointWith): no individual can belong to two "
@@ -602,8 +640,10 @@ def create_server(
             types.Tool(
                 name="ontology_summary",
                 description=(
-                    "Get a summary of the current ontology: "
-                    "class/property/individual/restriction counts, root classes, chunk processing progress."
+                    "Get a summary of the current ontology: class/property/individual/restriction counts, "
+                    "materialized inferences (inferred_triples), the outcome of the last ontology_check since the "
+                    "server started (last_check: time, consistent, issues — later changes are not reflected), "
+                    "root classes, chunk processing progress."
                 ),
                 inputSchema={"type": "object", "properties": {}},
             ),
@@ -631,7 +671,9 @@ def create_server(
                     "owl:NamedIndividual, properties owl:ObjectProperty/owl:DatatypeProperty; labels are "
                     "rdfs:label (language-tagged), aliases rdfs:altLabel, definitions skos:definition; "
                     "provenance is <urn:olaf:extractedFrom> <urn:olaf:chunk:{chunk_id}> on entities and on "
-                    "rdf:Statement reification nodes for relations. "
+                    "rdf:Statement reification nodes for relations; triples inferred by the reasoner "
+                    "(ontology_infer) have no source chunk, and their reification node carries "
+                    "<urn:olaf:inferredBy> instead. "
                     "SELECT returns {variables, rows, row_count, truncated}; ASK returns {boolean}; "
                     "CONSTRUCT/DESCRIBE return Turtle. Syntax errors are returned verbatim — fix and retry."
                 ),
@@ -665,7 +707,9 @@ def create_server(
                     "consistency and unsatisfiable classes (classes that can have no instance), each with its "
                     "explanation, the minimal set of axioms causing it; and (2) closed-world SPARQL checks the "
                     "reasoner does not report: subclass cycles, untyped individuals, relations whose subject/object "
-                    "does not match the property's domain/range, and object/datatype property misuse. "
+                    "does not match the property's domain/range, object/datatype property misuse, and "
+                    "unknown_terms — RDF/RDFS/OWL/SKOS terms that do not exist (e.g. rdfs:subClassof), with "
+                    "the closest real term as `suggestion`. "
                     "`entities` maps the local names used in explanations to their URIs. "
                     "Fix each problem by removing or correcting at least one axiom of its explanation "
                     "(relation_delete, property_update, concept_merge…), then check again."
@@ -682,6 +726,43 @@ def create_server(
                             "description": "Explanations per problem (default: 1, max: 5)",
                         },
                         "limit": {"type": "integer", "description": "Max results per SPARQL check (default: 50)"},
+                    },
+                },
+            ),
+            types.Tool(
+                name="ontology_infer",
+                description=(
+                    "Infer what the ontology entails with the Pellet reasoner: subclass relations, class "
+                    "membership of individuals, equivalent classes, sub-properties, property assertions and "
+                    "same-individual links that are not asserted. The ontology must be consistent "
+                    "(ontology_check). action=preview (default) lists the new inferences, each with why it holds: "
+                    "`taxonomic` ones follow from the asserted class hierarchy alone (their chain of axioms is "
+                    "given), the others are explained by the reasoner (up to max_explained). An absurd "
+                    "inference reveals a wrong axiom in its explanation — fix that axiom, not the inference. "
+                    "Each inference says whether it is already `materialized`. "
+                    "action=materialize writes the inferences into the ontology, replacing those written before; "
+                    "each one is marked on its rdf:Statement node with <urn:olaf:inferredBy>, and ontology_check "
+                    "ignores them. action=clear removes them. concept_merge also removes them."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["preview", "materialize", "clear"],
+                            "description": "preview (default), materialize or clear",
+                        },
+                        "include_seeds": {
+                            "type": "boolean",
+                            "description": "Reason over the seed graphs too, e.g. to infer that a class is a "
+                                           "subclass of a seed class (default: false). Only inferences about "
+                                           "the ontology's own entities are kept.",
+                        },
+                        "max_explained": {
+                            "type": "integer",
+                            "description": "preview: non-taxonomic inferences to explain with the reasoner "
+                                           "(default: 20, max: 100 — each takes a few seconds)",
+                        },
                     },
                 },
             ),
@@ -892,6 +973,22 @@ def create_server(
                     )
                     return _text({"restriction_bnode": bnode})
 
+                case "restriction_delete":
+                    return _text(await onto.restriction_delete(
+                        oid,
+                        class_uri=arguments["class_uri"],
+                        property_uri=arguments["property_uri"],
+                        restriction_type=arguments.get("restriction_type"),
+                        value=arguments.get("value"),
+                        is_literal_value=arguments.get("is_literal_value", False),
+                    ))
+
+                case "entity_delete":
+                    result = await onto.entity_delete(oid, arguments["uri"])
+                    if embed and (warning := _index(lambda: embed.delete_concept(arguments["uri"]))):
+                        result["warning"] = warning
+                    return _text(result)
+
                 case "disjoint_add":
                     return _text(await onto.disjoint_add(oid, arguments["class_uris"]))
 
@@ -957,7 +1054,38 @@ def create_server(
                         + len(r.get("unsatisfiable_classes", []))
                         + sum(len(v) for v in report["integrity"].values())
                     )
+                    onto.record_check(oid, r.get("consistent"), report["issues"])
                     return _text(report)
+
+                case "ontology_infer":
+                    if not reasoner:
+                        return _err("Reasoner disabled in config ([reasoner] enabled = false)")
+                    action = arguments.get("action", "preview")
+                    if action == "clear":
+                        return _text({"removed": await onto.inferences_clear(oid)})
+                    if action not in ("preview", "materialize"):
+                        return _err(f"Unknown action: {action} (expected preview, materialize or clear)")
+                    include_seeds = arguments.get("include_seeds", False)
+                    data = await onto.reasoner_input(oid, include_seeds=include_seeds)
+                    result = await reasoner.infer(data)
+                    if not result["consistent"]:
+                        return _err("The ontology is inconsistent, so nothing can be inferred from it: "
+                                    "fix it first (ontology_check).")
+                    triples = result["inferences"]
+                    if include_seeds:  # keep inferences about the ontology's entities, not the seeds'
+                        own = await onto.reasoner_input(oid)
+                        subjects = {line.split(" ", 1)[0][1:-1] for line in own.decode().splitlines() if line}
+                        triples = [t for t in triples if t[0] in subjects]
+                    if action == "materialize":
+                        replaced = len(await onto.inferences_list(oid))
+                        stored = await onto.inferences_store(oid, [(s, p, f"<{o}>") for s, p, o in triples], by="pellet")
+                        return _text({"stored": stored, "replaced": replaced})
+                    max_explained = max(0, min(int(arguments.get("max_explained", 20)), 100))
+                    stored = {(s, p, o[1:-1]) for s, p, o in await onto.inferences_list(oid)}
+                    items = await reasoner.explain_inferences(data, triples, max_explained)
+                    for item in items:  # already materialized by an earlier run
+                        item["materialized"] = (item["subject"], item["predicate"], item["object"]) in stored
+                    return _text({"count": len(triples), "materialized": len(stored), "inferences": items})
 
                 case "sparql_query":
                     limit = max(1, min(int(arguments.get("limit", 100)), 1000))

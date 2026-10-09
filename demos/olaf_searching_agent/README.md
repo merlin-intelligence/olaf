@@ -17,7 +17,7 @@ For each question the agent runs a tool loop, capped at `max_iterations` rounds:
 1. **Locate** the entities in the question with `concept_search` and `concept_semantic_search`, plus `property_search` for relations.
 2. **Explore** around them with `concept_get` and `relation_search`.
 3. **Query** with `sparql_query` when the question needs lists, counts, joins, hierarchies or paths. The LLM writes the SPARQL; when a query fails or returns nothing, it reads the error and tries a corrected version.
-4. **Ground** the answer by following provenance (`urn:olaf:extractedFrom`) back to the chunks and reading them with `chunk_read_batch`.
+4. **Ground** the answer by following provenance (`urn:olaf:extractedFrom`) back to the chunks and reading them with `chunk_read_batch`. Triples inferred by the reasoner (materialized by [`olaf_reasoning_agent`](../olaf_reasoning_agent/), marked `<urn:olaf:inferredBy>`) have no source chunk: when an answer rests on one, the agent says it is inferred and cites the chunks of the asserted facts it follows from.
 5. **Answer** in the language of the question, citing concepts and chunks (`[chunk <id>, doc <doc_id>]`).
 
 The conversation is kept between questions, so follow-ups such as "and which of those are in France?" work. To keep the context small, tool results older than the last `keep_recent_turns` LLM turns are cut to a short preview; the LLM re-runs a tool if it needs the full result again.
@@ -80,7 +80,7 @@ export SCW_SECRET_KEY=...   # IAM API key secret
 
 The agent does not read `.env` files: export the variable in the shell that runs it.
 
-When the provider answers HTTP 429 (rate limit), the call is retried after 15 s, 30 s, then 60 s, up to `[litellm] rate_limit_retries` times (default 6).
+When the provider answers HTTP 429 (rate limit), the call is retried after 15 s, 30 s, then 60 s, up to `[litellm] rate_limit_retries` times (default 6). Timeouts, connection errors and 5xx answers are retried too, after 10 s, up to `[litellm] transient_retries` times (default 2) — if timeouts keep coming back, the model is too slow for the work asked per call: raise `timeout`, or use a faster model.
 
 ## Running
 

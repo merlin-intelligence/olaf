@@ -15,7 +15,7 @@ Text chunks (Qdrant)  ──►  LLM agent  ──►  OWL ontology (Oxigraph)
                               │  ▲
                      seed TTLs│  │ concept_search / concept_semantic_search
                               ▼  │
-                          33 MCP tools
+                          36 MCP tools
 ```
 
 **Storage split:**
@@ -135,10 +135,11 @@ enabled = true
 | `ontology_list` | List all ontologies in the store with id, name, base_uri, class count, and active flag. |
 | `ontology_create` | Create a new empty ontology. Parameters: `ontology_id`, `name`, optional `base_uri`. |
 | `ontology_switch` | Switch the active ontology for this session. All subsequent tools operate on the selected ontology. |
-| `ontology_summary` | Counts of classes, properties, individuals, restrictions, root classes, and chunk processing progress. Includes `active_ontology`. |
+| `ontology_summary` | Counts of classes, properties, individuals, restrictions, root classes, and chunk processing progress. Includes `active_ontology`, the number of materialized inferences (`inferred_triples`) and the outcome of the last `ontology_check` since the server started (`last_check`: time, consistent, issues — later changes are not reflected until the next check). |
 | `ontology_export` | Export the active ontology as Turtle. Pass `include_seeds=true` to append all seed graphs. |
 | `ontology_orphans` | List classes/individuals with no relation to the rest of the graph beyond their own type/label/definition triples. |
-| `ontology_check` | Check the ontology for logical errors: Pellet OWL 2 DL reasoning (consistency + unsatisfiable classes, each with its explanation) plus closed-world SPARQL checks (subclass cycles, untyped individuals, domain/range violations, object/datatype property misuse). See [Consistency checking](#consistency-checking). |
+| `ontology_check` | Check the ontology for logical errors: Pellet OWL 2 DL reasoning (consistency + unsatisfiable classes, each with its explanation) plus closed-world SPARQL checks (subclass cycles, untyped individuals, domain/range violations, object/datatype property misuse, unknown vocabulary terms such as `rdfs:subClassof`). See [Consistency checking](#consistency-checking). |
+| `ontology_infer` | What the ontology entails but does not assert (Pellet): subclass relations, class membership of individuals, equivalent classes, sub-properties, property assertions, same-individual links. `action=preview` (default) lists them with why each holds; `materialize` writes them into the ontology, marked as inferred; `clear` removes them. See [Inference](#inference). |
 
 ### Chunks
 
@@ -158,10 +159,10 @@ enabled = true
 | `concept_search` | Substring search on `rdfs:label` and `rdfs:altLabel` via SPARQL. Returns `source_chunk_id` when available. Call before `concept_create`. |
 | `concept_semantic_search` | Vector similarity search in the active ontology's Qdrant collection. Finds near-duplicates even with different wording. Returns `source_chunk_id` when available. Call alongside `concept_search`. |
 | `concept_create` | Create an `owl:Class`. Generates a CamelCase URI from the label. Optional `source_chunk_id` to record which chunk the concept was extracted from. Returns `{uri, created}` — `created=false` if the URI already exists. |
-| `concept_get` | Get all triples for a concept: type, label, definition, aliases, `subClassOf`, restrictions, `source_chunk_ids`. |
+| `concept_get` | Get all triples for a concept: type, label, definition, aliases, `subClassOf`, `source_chunk_ids`, and its OWL restrictions as `restrictions` (in `restriction_add` / `restriction_delete` terms). |
 | `concept_update` | Update label, definition, or aliases (`aliases_add` / `aliases_remove`). |
 | `individual_create` | Create an `owl:NamedIndividual` (a specific named entity such as "GDPR") as an instance of `class_uri`. Returns `{uri, created}`. If it already exists, `source_chunk_id` is added to its sources. |
-| `concept_merge` | Merge two concepts: all triples from `merge_uri` move to `keep_uri`, all references re-pointed, `merge_uri` deleted. A relation between the two (e.g. `merge_uri` subClassOf `keep_uri`) is dropped rather than turned into a self-loop. |
+| `concept_merge` | Merge two concepts: all triples from `merge_uri` move to `keep_uri`, all references re-pointed, `merge_uri` deleted. The kept concept keeps its label and definition: the merged one's labels become `rdfs:altLabel`, and its definition is used only if the kept one has none. A relation between the two (e.g. `merge_uri` subClassOf `keep_uri`) is dropped rather than turned into a self-loop. The provenance of the re-pointed relations is kept (`relation_sources` on the new triples). |
 
 ### Properties (`owl:ObjectProperty` / `owl:DatatypeProperty`)
 
@@ -176,11 +177,13 @@ enabled = true
 
 | Tool | Description |
 |------|-------------|
-| `relation_add` | Insert any triple `(subject, property, object)`. Use full URIs. Set `is_literal=true` for literal objects; optionally pass `datatype` (XSD URI). Rejects subject/property/object URIs that look like they belong to this ontology but don't exist yet. |
+| `relation_add` | Insert any triple `(subject, property, object)`. Use full URIs. Set `is_literal=true` for literal objects; optionally pass `datatype` (XSD URI). Rejects subject/property/object URIs that look like they belong to this ontology but don't exist yet, and RDF/RDFS/OWL/SKOS terms that do not exist (e.g. `rdfs:subClassof`, with the closest real term as a hint). |
 | `relation_delete` | Remove a triple `(subject, property, object)`. Same parameters as `relation_add`. |
 | `relation_search` | Find triples by pattern. All three parameters are optional. |
 | `relation_sources` | Get the chunk IDs a `(subject, property, object)` triple was extracted from. |
 | `restriction_add` | Add an `owl:Restriction` blank node to a class. Supports `some`, `all`, `has_value`, `exactly`, `min`, `max`. |
+| `restriction_delete` | Delete the restrictions of a class on a property — all, or those of a given `restriction_type` and/or `value`. Reaches the blank nodes `relation_delete` cannot. |
+| `entity_delete` | Delete a class, individual or property of the ontology entirely: every triple it appears in, their provenance, its restrictions and those pointing to it, its semantic-index entry. Only entities of the ontology's namespace. Irreversible. |
 | `disjoint_add` | Declare 2+ classes pairwise disjoint (`owl:disjointWith`). Rejects non-classes and classes in a subclass relation. Undo a pair with `relation_delete`. |
 
 `restriction_add` produces:
@@ -197,13 +200,25 @@ enabled = true
 `ontology_check` combines two kinds of checks, because OWL semantics alone catch few of the mistakes an extraction agent makes:
 
 - **Reasoner (open world).** The [Pellet](https://github.com/stardog-union/pellet) reasoner bundled with `owlready2` runs on the ontology's logical content (provenance triples and `owl:imports` are stripped). It reports whether the ontology is **consistent** and lists **unsatisfiable classes** — classes that can have no instance. Each problem comes with an *explanation*: the minimal set of axioms causing it, e.g. `Organisation disjointWith Person`, `Employee subClassOf Organisation`, `Employee subClassOf Person`. `entities` maps the local names used in explanations to full URIs. If the ontology is inconsistent, unsatisfiable classes are not computed: fix the inconsistency first and check again.
-- **Integrity checks (closed world, SPARQL).** In OWL, `rdfs:domain`/`rdfs:range` do not *constrain* — they *infer* types — and a relation between two classes (punning) is not constrained at all; a subclass cycle silently means equivalence. These checks report what the reasoner considers fine but is almost always an extraction error.
+- **Integrity checks (closed world, SPARQL).** In OWL, `rdfs:domain`/`rdfs:range` do not *constrain* — they *infer* types — and a relation between two classes (punning) is not constrained at all; a subclass cycle silently means equivalence. These checks report what the reasoner considers fine but is almost always an extraction error — and **unknown vocabulary terms**: a typo such as `rdfs:subClassof` makes a triple no tool or reasoner understands, so it silently means nothing; each one comes with the closest real term as `suggestion`. `rdfs:altLabel`, which OLAF has always used for aliases, is accepted although the standard term is `skos:altLabel`.
 
 The reasoner can only find contradictions the ontology states. **Without `owl:disjointWith` axioms, an ontology is almost never inconsistent** — declare sibling classes that cannot overlap disjoint with `disjoint_add`.
 
 [`olaf_reasoning_agent`](demos/olaf_reasoning_agent/) runs these checks on a built ontology and has an LLM repair what they report.
 
 Requires Java 11+ (included in the Docker image). Settings live under `[reasoner]` in `config.toml` (`enabled`, `java`, `memory_mb`, `timeout_seconds`). When the reasoner is disabled or Java is missing, `ontology_check` still runs the integrity checks and reports the reasoner error.
+
+### Inference
+
+`ontology_infer` runs Pellet on a **consistent** ontology and returns what it entails but does not assert: indirect superclasses, the inherited types of individuals, and what follows from domains, ranges, equivalences, restrictions and property axioms. Trivial entailments (`X ⊑ owl:Thing`, `X ≡ X`…) are left out, and so is the type a class gets when it is used as an individual in a relation between classes (punning).
+
+- **`preview`** lists the inferences, each with why it holds. *Taxonomic* ones follow from the asserted class hierarchy alone and come with their chain of `rdf:type` / `rdfs:subClassOf` axioms; the reasoner explains the others (`max_explained`, a few seconds each). An absurd inference — e.g. an agent inferred to be a language model — reveals a wrong axiom in its explanation: fix that axiom, not the inference.
+- **`materialize`** writes them into the ontology graph, replacing those written before. Each inferred triple gets a reification node marked `<urn:olaf:inferredBy> "pellet"` (and no source chunk), so it can be told apart from what was extracted. Asserting an inferred triple later (`relation_add`, …) removes its mark.
+- **`clear`** removes them. `concept_merge` does too, as a merge changes what can be inferred.
+
+`ontology_check` and `ontology_orphans` ignore materialized inferences: an inferred `rdf:type` would otherwise hide the very domain/range violation that caused it. With `include_seeds=true`, the seeds take part in the reasoning, but only inferences about the ontology's own entities are kept.
+
+[`olaf_reasoning_agent`](demos/olaf_reasoning_agent/) has an LLM review the new inferences, then materializes them.
 
 ### Querying
 
@@ -260,7 +275,9 @@ For each chunk:
 
 11. ontology_orphans()               → connect or justify any isolated entity
 12. ontology_check()                 → fix each reported problem, check again until clean
-13. ontology_export()
+13. ontology_infer()                 → review the inferences, fix the axioms behind absurd ones,
+    ontology_infer(action="materialize")  then store them
+14. ontology_export()
 ```
 
 ### Querying workflow
