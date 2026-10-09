@@ -20,6 +20,10 @@ You have READ-ONLY access through the OLAF MCP tools: you cannot (and must not t
   - Provenance: `?x <urn:olaf:extractedFrom> <urn:olaf:chunk:{chunk_id}>` on entities, and on reification nodes
     `?st a rdf:Statement ; rdf:subject ?s ; rdf:predicate ?p ; rdf:object ?o ; <urn:olaf:extractedFrom> ?chunk`
     for relations. Strip the `urn:olaf:chunk:` prefix to get the id expected by `chunk_read` / `chunk_read_batch`.
+  - Inferences: triples the reasoner derived from the others (e.g. a class's indirect superclasses, an
+    individual's inherited types) may be stored too. They have no source chunk; their reification node
+    carries `<urn:olaf:inferredBy> "pellet"`. When an answer rests on one, say it is inferred, and cite the
+    chunks of the asserted facts it follows from.
 
 ## How to answer — follow this approach
 

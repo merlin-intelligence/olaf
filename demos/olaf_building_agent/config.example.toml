@@ -65,16 +65,11 @@ max_batches = 0      # stop after N batches (0 = process all pending chunks) —
 # (the LLM finds the others with concept_search / property_search).
 digest_max_entries = 150
 
-# Max LLM ↔ tool rounds per task (a batch, a dedup group)
+# Max LLM ↔ tool rounds per batch
 max_iterations = 30
 
-# ── Phase 2: consolidation ──
-# After extraction: near-duplicate classes (concept embeddings) are reviewed by the LLM
-# (merge or keep). No LLM call when there are no candidates.
-# Logical problems (reasoner, integrity checks, orphans) are repaired by olaf_reasoning_agent.
-consolidate          = true
-dedup_threshold      = 0.9   # min semantic similarity for a pair of classes to be reviewed
-dedup_pairs_per_task = 20    # candidate pairs reviewed per LLM conversation
+# Curation (deduplication, consistency repair, disjointness, inference) is olaf_reasoning_agent's
+# job: run it on the ontology once it is built.
 
 # ── Context pruning (within a task) ──
 max_tool_result_chars = 20000   # a single tool result is truncated beyond this

@@ -1,5 +1,7 @@
 from __future__ import annotations
 import asyncio
+import contextlib
+import difflib
 import hashlib
 import re
 import uuid
@@ -91,6 +93,89 @@ def _split_chunks(concatenated: str | None) -> list[str]:
     return [_chunk_id_from_uri(c) for c in concatenated.split("|") if c]
 
 
+# Marks, on a triple's rdf:Statement node, that the triple was materialized by the reasoner
+# (ontology_infer) rather than extracted or asserted. Such triples are left out of
+# ontology_check, and replaced on each materialization.
+INFERRED_BY = "urn:olaf:inferredBy"
+
+# Triples that are only there because the reasoner inferred them: marked, and not (also)
+# extracted from a chunk — by any of the statement nodes describing the triple, as a merge
+# can leave several. `?st`, `?s`, `?p`, `?o` are bound by the pattern.
+_INFERRED_ONLY = f"""
+    ?st <{INFERRED_BY}> ?_by ; rdf:subject ?s ; rdf:predicate ?p ; rdf:object ?o .
+    FILTER NOT EXISTS {{
+        ?_src rdf:subject ?s ; rdf:predicate ?p ; rdf:object ?o ; <urn:olaf:extractedFrom> ?_chunk
+    }}
+"""
+
+
+# Terms of the standard vocabularies. A term of their namespaces outside these lists is a typo
+# (e.g. rdfs:subClassof) that no tool or reasoner understands: refused on write, reported by the
+# integrity checks.
+_VOCABULARIES = {
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#": {
+        "type", "Property", "Statement", "subject", "predicate", "object", "value", "List", "first",
+        "rest", "nil", "Bag", "Seq", "Alt", "langString", "XMLLiteral", "HTML", "JSON", "PlainLiteral",
+    },
+    "http://www.w3.org/2000/01/rdf-schema#": {
+        "Resource", "Class", "Literal", "Datatype", "Container", "ContainerMembershipProperty",
+        "subClassOf", "subPropertyOf", "domain", "range", "label", "comment", "seeAlso",
+        "isDefinedBy", "member",
+        # Not an RDFS term (the standard one is skos:altLabel), but OLAF's own convention for
+        # aliases since the start (concept_create, concept_merge…): accepted as such.
+        "altLabel",
+    },
+    "http://www.w3.org/2002/07/owl#": {
+        "AllDifferent", "AllDisjointClasses", "AllDisjointProperties", "allValuesFrom",
+        "annotatedProperty", "annotatedSource", "annotatedTarget", "Annotation", "AnnotationProperty",
+        "assertionProperty", "AsymmetricProperty", "Axiom", "backwardCompatibleWith",
+        "bottomDataProperty", "bottomObjectProperty", "cardinality", "Class", "complementOf",
+        "DataRange", "datatypeComplementOf", "DatatypeProperty", "deprecated", "DeprecatedClass",
+        "DeprecatedProperty", "differentFrom", "disjointUnionOf", "disjointWith", "distinctMembers",
+        "equivalentClass", "equivalentProperty", "FunctionalProperty", "hasKey", "hasSelf",
+        "hasValue", "imports", "incompatibleWith", "intersectionOf", "InverseFunctionalProperty",
+        "inverseOf", "IrreflexiveProperty", "maxCardinality", "maxQualifiedCardinality", "members",
+        "minCardinality", "minQualifiedCardinality", "NamedIndividual", "NegativePropertyAssertion",
+        "Nothing", "ObjectProperty", "onClass", "onDataRange", "onDatatype", "oneOf",
+        "onProperties", "onProperty", "Ontology", "OntologyProperty", "priorVersion",
+        "propertyChainAxiom", "propertyDisjointWith", "qualifiedCardinality", "ReflexiveProperty",
+        "Restriction", "sameAs", "someValuesFrom", "sourceIndividual", "SymmetricProperty",
+        "targetIndividual", "targetValue", "Thing", "topDataProperty", "topObjectProperty",
+        "TransitiveProperty", "unionOf", "versionInfo", "versionIRI", "withRestrictions",
+    },
+    "http://www.w3.org/2004/02/skos/core#": {
+        "Concept", "ConceptScheme", "Collection", "OrderedCollection", "prefLabel", "altLabel",
+        "hiddenLabel", "definition", "note", "scopeNote", "example", "historyNote", "editorialNote",
+        "changeNote", "notation", "broader", "narrower", "related", "broaderTransitive",
+        "narrowerTransitive", "semanticRelation", "inScheme", "hasTopConcept", "topConceptOf",
+        "member", "memberList", "mappingRelation", "exactMatch", "closeMatch", "broadMatch",
+        "narrowMatch", "relatedMatch",
+    },
+}
+
+
+def _unknown_term(uri: str) -> tuple[str, str | None] | None:
+    """(term, closest known term) if `uri` is in a standard vocabulary's namespace but is not
+    one of its terms, else None."""
+    for ns, terms in _VOCABULARIES.items():
+        if uri.startswith(ns):
+            local = uri[len(ns):]
+            if local in terms:
+                return None
+            close = difflib.get_close_matches(local, terms, n=1, cutoff=0.6) or [
+                t for t in terms if t.lower() == local.lower()
+            ]
+            return uri, (ns + close[0]) if close else None
+    return None
+
+
+def _statements_of(subject_uri: str, property_uri: str, obj_term: str, var: str = "?st") -> str:
+    """Pattern matching every rdf:Statement node that describes a triple. Provenance is
+    looked up by content, not by the node's URI: the URI is a hash of the triple as it was
+    first recorded, which concept_merge does not rename when it re-points the triple."""
+    return f"{var} rdf:subject <{subject_uri}> ; rdf:predicate <{property_uri}> ; rdf:object {obj_term} ."
+
+
 def _stmt_uri(subject_uri: str, property_uri: str, obj_term: str) -> str:
     """Deterministic URI identifying a (subject, property, object) triple, so its
     provenance (extractedFrom) can be looked up or extended without needing to
@@ -179,6 +264,16 @@ class OntologyStore:
     def __init__(self, url: str):
         self._ex = _HttpExecutor(url)
         self._meta: dict[str, tuple[str, str]] = {}
+        # Outcome of the last ontology_check per ontology, since the server started.
+        self._last_check: dict[str, dict] = {}
+
+    def record_check(self, ontology_id: str, consistent: bool | None, issues: int) -> None:
+        from datetime import datetime, timezone
+        self._last_check[ontology_id] = {
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "consistent": consistent,
+            "issues": issues,
+        }
 
     # ── Internal helpers ───────────────────────────────────────────────────
 
@@ -401,6 +496,8 @@ class OntologyStore:
                 result["definition"] = t["object"]
             if t["predicate"] == "urn:olaf:extractedFrom":
                 result["source_chunk_ids"].append(_chunk_id_from_uri(t["object"]))
+        if restrictions := await self.restrictions_of(ontology_id, uri):
+            result["restrictions"] = restrictions
 
         return result
 
@@ -484,6 +581,9 @@ class OntologyStore:
         _check_uri(keep_uri)
         _check_uri(merge_uri)
         graph = self._graph(ontology_id)
+        # Inferred marks are keyed by triple: re-pointing the triples would leave them stale.
+        # A merge changes what can be inferred anyway — ontology_infer computes them again.
+        await self.inferences_clear(ontology_id)
         await self._ex.execute_update(f"""
         {_PREFIXES}
         INSERT {{
@@ -492,9 +592,28 @@ class OntologyStore:
         WHERE {{
             GRAPH <{graph}> {{
                 <{merge_uri}> ?p ?o .
+                FILTER(?p NOT IN (rdfs:label, skos:definition))
                 FILTER NOT EXISTS {{ GRAPH <{graph}> {{ <{keep_uri}> ?p ?o }} }}
             }}
         }}
+        """)
+        # The kept concept keeps a single label and definition: the merged one's labels become
+        # alternative labels, and its definition is taken only if the kept one has none.
+        await self._ex.execute_update(f"""
+        {_PREFIXES}
+        INSERT {{ GRAPH <{graph}> {{ <{keep_uri}> rdfs:altLabel ?l }} }}
+        WHERE  {{ GRAPH <{graph}> {{
+            <{merge_uri}> rdfs:label ?l .
+            FILTER NOT EXISTS {{ <{keep_uri}> rdfs:label ?kl . FILTER(STR(?kl) = STR(?l)) }}
+        }} }}
+        """)
+        await self._ex.execute_update(f"""
+        {_PREFIXES}
+        INSERT {{ GRAPH <{graph}> {{ <{keep_uri}> skos:definition ?d }} }}
+        WHERE  {{ GRAPH <{graph}> {{
+            <{merge_uri}> skos:definition ?d .
+            FILTER NOT EXISTS {{ <{keep_uri}> skos:definition ?kd }}
+        }} }}
         """)
         await self._ex.execute_update(f"""
         {_PREFIXES}
@@ -515,6 +634,120 @@ class OntologyStore:
         DELETE {{ GRAPH <{graph}> {{ <{keep_uri}> ?p <{keep_uri}> }} }}
         WHERE  {{ GRAPH <{graph}> {{ <{keep_uri}> ?p <{keep_uri}> }} }}
         """)
+        await self._ex.execute_update(f"""
+        {_PREFIXES}
+        DELETE {{ GRAPH <{graph}> {{ ?st ?sp ?so }} }}
+        WHERE  {{ GRAPH <{graph}> {{
+            ?st rdf:subject <{keep_uri}> ; rdf:object <{keep_uri}> ; ?sp ?so .
+        }} }}
+        """)
+
+    async def _count(self, graph: str) -> int:
+        rows = await self._ex.execute_select(
+            f"SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o }} }}", ["n"]
+        )
+        return int(rows[0]["n"] or 0) if rows else 0
+
+    async def entity_delete(self, ontology_id: str, uri: str) -> dict:
+        """Delete a class, individual or property of the ontology: every triple it appears
+        in (as subject, property or object), the provenance records of those triples, its
+        own restrictions and the restrictions that point to it."""
+        _check_uri(uri)
+        graph = self._graph(ontology_id)
+        base = await self._resolve_base(ontology_id)
+        if not uri.startswith(base):
+            raise ValueError(f"{uri} is not in this ontology's namespace ({base}#): only its own entities can be deleted.")
+        if not await self._ex.execute_ask(f"ASK {{ GRAPH <{graph}> {{ <{uri}> ?p ?o }} }}"):
+            raise ValueError(f"Entity not found: {uri}")
+        before = await self._count(graph)
+        # Restrictions (blank nodes) the entity owns or that point to it, whole.
+        await self._ex.execute_update(f"""
+        {_PREFIXES}
+        DELETE {{ GRAPH <{graph}> {{ ?c rdfs:subClassOf ?r . ?r ?rp ?ro }} }}
+        WHERE  {{ GRAPH <{graph}> {{
+            ?c rdfs:subClassOf ?r . FILTER(isBlank(?r))
+            {{ FILTER(?c = <{uri}>) }} UNION {{ ?r ?x <{uri}> }}
+            ?r ?rp ?ro .
+        }} }}
+        """)
+        for update in (
+            f"DELETE {{ GRAPH <{graph}> {{ ?st ?sp ?so }} }} WHERE {{ GRAPH <{graph}> {{ "
+            f"?st rdf:subject|rdf:predicate|rdf:object <{uri}> . ?st a rdf:Statement ; ?sp ?so }} }}",
+            f"DELETE {{ GRAPH <{graph}> {{ <{uri}> ?p ?o }} }} WHERE {{ GRAPH <{graph}> {{ <{uri}> ?p ?o }} }}",
+            f"DELETE {{ GRAPH <{graph}> {{ ?s <{uri}> ?o }} }} WHERE {{ GRAPH <{graph}> {{ ?s <{uri}> ?o }} }}",
+            f"DELETE {{ GRAPH <{graph}> {{ ?s ?p <{uri}> }} }} WHERE {{ GRAPH <{graph}> {{ ?s ?p <{uri}> }} }}",
+        ):
+            await self._ex.execute_update(f"{_PREFIXES}\n{update}")
+        return {"deleted": uri, "triples_removed": before - await self._count(graph)}
+
+    @staticmethod
+    def _restriction_pattern(class_uri: str, property_uri: str, restriction_type: str | None, value: str | None,
+                             is_literal_value: bool) -> str:
+        _check_uri(class_uri)
+        _check_uri(property_uri)
+        lines = [f"<{class_uri}> rdfs:subClassOf ?r . ?r a owl:Restriction ; owl:onProperty <{property_uri}> ."]
+        if restriction_type:
+            if restriction_type not in _RESTRICTION_PROP:
+                raise ValueError(f"Unknown restriction_type '{restriction_type}'. Valid: {list(_RESTRICTION_PROP)}")
+            preds = [_RESTRICTION_PROP[restriction_type]]
+            if restriction_type in _UNQUALIFIED_RESTRICTION_PROP:
+                preds.append(_UNQUALIFIED_RESTRICTION_PROP[restriction_type])
+            lines.append(f"?r ?_tp ?_tv . FILTER(?_tp IN ({', '.join(preds)}))")
+        if value:
+            obj = f'"{_esc(value)}"' if is_literal_value else f"<{_check_uri(value)}>"
+            if is_literal_value:
+                lines.append(f"?r owl:hasValue ?_v . FILTER(STR(?_v) = {obj})")
+            else:
+                lines.append(f"?r ?_vp {obj} . FILTER(?_vp IN (owl:someValuesFrom, owl:allValuesFrom, owl:hasValue, owl:onClass))")
+        return "\n            ".join(lines)
+
+    async def restriction_delete(
+        self,
+        ontology_id: str,
+        class_uri: str,
+        property_uri: str,
+        restriction_type: str | None = None,
+        value: str | None = None,
+        is_literal_value: bool = False,
+    ) -> dict:
+        """Delete the restrictions of a class on a property — all of them, or those of a
+        given type and/or value. Returns how many were deleted."""
+        graph = self._graph(ontology_id)
+        pattern = self._restriction_pattern(class_uri, property_uri, restriction_type, value, is_literal_value)
+        rows = await self._ex.execute_select(f"""
+        {_PREFIXES}
+        SELECT (COUNT(DISTINCT ?r) AS ?n) WHERE {{ GRAPH <{graph}> {{ {pattern} }} }}
+        """, ["n"])
+        count = int(rows[0]["n"] or 0) if rows else 0
+        if count:
+            await self._ex.execute_update(f"""
+            {_PREFIXES}
+            DELETE {{ GRAPH <{graph}> {{ <{class_uri}> rdfs:subClassOf ?r . ?r ?rp ?ro }} }}
+            WHERE  {{ GRAPH <{graph}> {{ {pattern} ?r ?rp ?ro . }} }}
+            """)
+        return {"removed": count}
+
+    async def restrictions_of(self, ontology_id: str, class_uri: str) -> list[dict]:
+        """The OWL restrictions on a class, in restriction_add's / restriction_delete's terms."""
+        names = {f"http://www.w3.org/2002/07/owl#{v.split(':')[1]}": k for k, v in _RESTRICTION_PROP.items()}
+        names.update({f"http://www.w3.org/2002/07/owl#{v.split(':')[1]}": k for k, v in _UNQUALIFIED_RESTRICTION_PROP.items()})
+        rows = await self._ex.execute_select(f"""
+        {_PREFIXES}
+        SELECT ?r ?prop ?kind ?val ?cls WHERE {{ GRAPH <{self._graph(ontology_id)}> {{
+            <{class_uri}> rdfs:subClassOf ?r . ?r a owl:Restriction ; owl:onProperty ?prop ; ?kind ?val .
+            FILTER(?kind IN ({", ".join(f"<{k}>" for k in names)}))
+            OPTIONAL {{ ?r owl:onClass ?cls }}
+        }} }}
+        """, ["r", "prop", "kind", "val", "cls"])
+        out = []
+        for r in rows:
+            kind = names.get(r["kind"] or "", "")
+            if kind in ("exactly", "min", "max"):
+                out.append({"property": r["prop"], "restriction_type": kind, "cardinality": int(r["val"] or 0),
+                            "value": r["cls"] or ""})
+            else:
+                out.append({"property": r["prop"], "restriction_type": kind, "value": r["val"]})
+        return out
 
     async def concept_list(self, ontology_id: str, root_only: bool = False, limit: int = 100) -> list[dict]:
         root_filter = ""
@@ -699,6 +932,7 @@ class OntologyStore:
                 {_PREFIXES}
                 INSERT DATA {{ GRAPH <{graph}> {{ <{uri}> rdfs:subPropertyOf <{_check_uri(parent_uri)}> }} }}
                 """)
+                await self._unmark_inferred(graph, [(uri, "http://www.w3.org/2000/01/rdf-schema#subPropertyOf", f"<{parent_uri}>")])
 
     async def property_get(self, ontology_id: str, uri: str) -> dict | None:
         _check_uri(uri)
@@ -778,6 +1012,26 @@ class OntologyStore:
             return f'"{_esc(object_value)}"^^<{_check_uri(datatype)}>' if datatype else f'"{_esc(object_value)}"'
         return f"<{_check_uri(object_value)}>"
 
+    async def _unmark_inferred(self, graph: str, triples: list[tuple[str, str, str]]) -> None:
+        """A triple asserted by a tool call is no longer only inferred: drop its inferred
+        mark, so that clearing the inferences does not delete it — and its whole statement
+        node when the mark was all it carried (no source chunk)."""
+        for subject_uri, property_uri, obj_term in triples:
+            statements = _statements_of(subject_uri, property_uri, obj_term)
+            await self._ex.execute_update(f"""
+            {_PREFIXES}
+            DELETE {{ GRAPH <{graph}> {{ ?st ?sp ?so }} }}
+            WHERE  {{ GRAPH <{graph}> {{
+                {statements} ?st <{INFERRED_BY}> ?by ; ?sp ?so .
+                FILTER NOT EXISTS {{ ?st <urn:olaf:extractedFrom> ?chunk }}
+            }} }}
+            """)
+            await self._ex.execute_update(f"""
+            {_PREFIXES}
+            DELETE {{ GRAPH <{graph}> {{ ?st <{INFERRED_BY}> ?by }} }}
+            WHERE  {{ GRAPH <{graph}> {{ {statements} ?st <{INFERRED_BY}> ?by }} }}
+            """)
+
     async def _add_relation_source(
         self, graph: str, subject_uri: str, property_uri: str, obj_term: str, chunk_id: str
     ) -> None:
@@ -810,6 +1064,10 @@ class OntologyStore:
     ) -> None:
         _check_uri(subject_uri)
         _check_uri(property_uri)
+        for term in (property_uri, None if is_literal else object_value):
+            if term and (unknown := _unknown_term(term)):
+                hint = f" — did you mean {unknown[1]}?" if unknown[1] else ""
+                raise ValueError(f"{term} is not a term of its vocabulary{hint}")
         graph = self._graph(ontology_id)
         base = await self._resolve_base(ontology_id)
         await self._require_existing(graph, base, subject_uri)
@@ -824,6 +1082,7 @@ class OntologyStore:
             GRAPH <{graph}> {{ <{subject_uri}> <{property_uri}> {obj} }}
         }}
         """)
+        await self._unmark_inferred(graph, [(subject_uri, property_uri, obj)])
         if source_chunk_id is not None:
             await self._add_relation_source(graph, subject_uri, property_uri, obj, source_chunk_id)
 
@@ -846,13 +1105,11 @@ class OntologyStore:
             GRAPH <{graph}> {{ <{subject_uri}> <{property_uri}> {obj} }}
         }}
         """)
-        # Drop the reified provenance record for this triple, if any.
-        stmt = _stmt_uri(subject_uri, property_uri, obj)
+        # Drop the reified provenance records of this triple, if any.
         await self._ex.execute_update(f"""
         {_PREFIXES}
-        DELETE WHERE {{
-            GRAPH <{graph}> {{ <{stmt}> ?p ?o }}
-        }}
+        DELETE {{ GRAPH <{graph}> {{ ?st ?sp ?so }} }}
+        WHERE  {{ GRAPH <{graph}> {{ {_statements_of(subject_uri, property_uri, obj)} ?st ?sp ?so }} }}
         """)
 
     async def relation_sources(
@@ -869,11 +1126,10 @@ class OntologyStore:
         _check_uri(property_uri)
         graph = self._graph(ontology_id)
         obj = self._format_object(object_value, is_literal, datatype)
-        stmt = _stmt_uri(subject_uri, property_uri, obj)
         rows = await self._ex.execute_select(f"""
         {_PREFIXES}
-        SELECT ?chunk WHERE {{
-            GRAPH <{graph}> {{ <{stmt}> <urn:olaf:extractedFrom> ?chunk }}
+        SELECT DISTINCT ?chunk WHERE {{
+            GRAPH <{graph}> {{ {_statements_of(subject_uri, property_uri, obj)} ?st <urn:olaf:extractedFrom> ?chunk }}
         }}
         """, ["chunk"])
         return [_chunk_id_from_uri(row["chunk"]) for row in rows if row["chunk"]]
@@ -1031,10 +1287,44 @@ class OntologyStore:
 
     # ── Validation ────────────────────────────────────────────────────────
 
+    @contextlib.asynccontextmanager
+    async def _asserted_view(self, ontology_id: str):
+        """Graph to run the checks on: the ontology without its materialized inferences
+        (an inferred rdf:type or rdfs:subClassOf would hide the very errors the checks
+        look for). The ontology graph itself when it has none, else a temporary copy."""
+        graph = self._graph(ontology_id)
+        if not await self._ex.execute_ask(
+            f"ASK {{ GRAPH <{graph}> {{ ?st <{INFERRED_BY}> ?by }} }}"
+        ):
+            yield graph
+            return
+        view = f"urn:olaf:tmp:asserted:{uuid.uuid4().hex}"
+        try:
+            await self._ex.execute_update(f"COPY <{graph}> TO <{view}>")
+            await self._ex.execute_update(f"""
+            {_PREFIXES}
+            DELETE {{ GRAPH <{view}> {{ ?s ?p ?o }} }}
+            WHERE  {{ GRAPH <{view}> {{ {_INFERRED_ONLY} ?s ?p ?o }} }}
+            """)
+            # …and the inferred marks themselves, whose statement nodes reference entities.
+            await self._ex.execute_update(f"""
+            DELETE {{ GRAPH <{view}> {{ ?st ?sp ?so }} }}
+            WHERE  {{ GRAPH <{view}> {{
+                ?st <{INFERRED_BY}> ?by ; ?sp ?so .
+                FILTER NOT EXISTS {{ ?st <urn:olaf:extractedFrom> ?chunk }}
+            }} }}
+            """)
+            yield view
+        finally:
+            await self._ex.execute_update(f"DROP SILENT GRAPH <{view}>")
+
     async def orphans(self, ontology_id: str, limit: int = 100) -> list[dict]:
         """Classes/individuals with no relation to the rest of the graph beyond their own
         rdf:type/label/altLabel/definition/extractedFrom bookkeeping triples."""
-        graph = self._graph(ontology_id)
+        async with self._asserted_view(ontology_id) as graph:
+            return await self._orphans_in(graph, limit)
+
+    async def _orphans_in(self, graph: str, limit: int) -> list[dict]:
         rows = await self._ex.execute_select(f"""
         {_PREFIXES}
         SELECT ?e (SAMPLE(?lbl) AS ?label) (SAMPLE(?knd) AS ?kind) WHERE {{
@@ -1062,7 +1352,10 @@ class OntologyStore:
         """Closed-world checks the OWL reasoner does not report: under OWL semantics
         rdfs:domain/range only *infer* types (and a relation between two classes is
         punning, not constrained at all), and subclass cycles silently mean equivalence."""
-        graph = self._graph(ontology_id)
+        async with self._asserted_view(ontology_id) as graph:
+            return await self._integrity_checks_in(graph, limit)
+
+    async def _integrity_checks_in(self, graph: str, limit: int) -> dict:
         # Subject/object "conforms" to class ?c if it is an instance of ?c or a subclass of
         # ?c (relations between classes read as "every X relates to some Y").
         conforms = "(rdf:type|rdfs:subClassOf)/rdfs:subClassOf*"
@@ -1153,7 +1446,32 @@ class OntologyStore:
             "domain_violations": triples(domain, "expected"),
             "range_violations": triples(obj_range, "expected") + triples(data_range, "expected"),
             "property_kind_mismatches": triples(kind, "problem"),
+            "unknown_terms": await self._unknown_terms_in(graph, limit),
         }
+
+    async def _unknown_terms_in(self, graph: str, limit: int) -> list[dict]:
+        """Triples using, as property or as class, a term of a standard vocabulary's namespace
+        that the vocabulary does not define — a typo no tool or reasoner understands."""
+        namespaces = " || ".join(f'STRSTARTS(STR(?t), "{ns}")' for ns in _VOCABULARIES)
+        rows = await self._ex.execute_select(f"""
+        {_PREFIXES}
+        SELECT DISTINCT ?t WHERE {{ GRAPH <{graph}> {{
+            {{ ?s ?t ?o }} UNION {{ ?s rdf:type ?t }} FILTER({namespaces})
+        }} }}
+        """, ["t"])
+        found = []
+        for term, suggestion in filter(None, (_unknown_term(r["t"] or "") for r in rows)):
+            uses = await self._ex.execute_select(f"""
+            SELECT ?s ?p ?o WHERE {{ GRAPH <{graph}> {{
+                {{ ?s <{term}> ?o BIND(<{term}> AS ?p) }}
+                UNION {{ ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{term}>
+                         BIND(<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> AS ?p) BIND(<{term}> AS ?o) }}
+                FILTER(!STRSTARTS(STR(?s), "urn:olaf:stmt:"))
+            }} }} LIMIT {limit}
+            """, ["s", "p", "o"])
+            found += [{"subject": u["s"] or "", "property": u["p"] or "", "object": u["o"] or "",
+                       "term": term, "suggestion": suggestion or ""} for u in uses]
+        return found[:limit]
 
     # ── Seeds ─────────────────────────────────────────────────────────────
 
@@ -1245,7 +1563,8 @@ class OntologyStore:
     async def reasoner_input(self, ontology_id: str, include_seeds: bool = False) -> bytes:
         """The ontology's logical content as N-Triples, for the reasoner: provenance
         (extractedFrom, rdf:Statement reification nodes) is dropped, and so are
-        owl:imports, which would make the reasoner fetch ontologies over the network."""
+        owl:imports, which would make the reasoner fetch ontologies over the network, and
+        materialized inferences, so that explanations only cite asserted axioms."""
         graph = self._graph(ontology_id)
         graph_filter = f"?g = <{graph}>"
         if include_seeds:
@@ -1257,9 +1576,69 @@ class OntologyStore:
             FILTER({graph_filter})
             FILTER(?p NOT IN (<urn:olaf:extractedFrom>, owl:imports))
             FILTER(!STRSTARTS(STR(?s), "urn:olaf:stmt:"))
+            FILTER NOT EXISTS {{ GRAPH ?g {{ {_INFERRED_ONLY} }} }}
         }}
         """, "application/n-triples")
         return resp.content
+
+    # ── Materialized inferences ───────────────────────────────────────────
+
+    async def inferences_list(self, ontology_id: str) -> list[tuple[str, str, str]]:
+        """The (subject, predicate, object term) of the inferred-only triples."""
+        rows = await self._ex.execute_select(f"""
+        {_PREFIXES}
+        SELECT ?s ?p ?o WHERE {{ GRAPH <{self._graph(ontology_id)}> {{ {_INFERRED_ONLY} ?s ?p ?o }} }}
+        """, ["s", "p", "o"])
+        return [(r["s"] or "", r["p"] or "", f"<{r['o']}>") for r in rows]
+
+    async def inferences_clear(self, ontology_id: str) -> int:
+        """Delete the inferred-only triples and every inferred mark. Returns how many
+        triples were deleted."""
+        graph = self._graph(ontology_id)
+        count = len(await self.inferences_list(ontology_id))
+        await self._ex.execute_update(f"""
+        {_PREFIXES}
+        DELETE {{ GRAPH <{graph}> {{ ?s ?p ?o }} }}
+        WHERE  {{ GRAPH <{graph}> {{ {_INFERRED_ONLY} ?s ?p ?o }} }}
+        """)
+        # Statement nodes that only carried the mark go entirely; on the others (asserted
+        # triples whose mark was not dropped), only the mark goes.
+        await self._ex.execute_update(f"""
+        {_PREFIXES}
+        DELETE {{ GRAPH <{graph}> {{ ?st ?sp ?so }} }}
+        WHERE  {{ GRAPH <{graph}> {{
+            ?st <{INFERRED_BY}> ?by ; ?sp ?so .
+            FILTER NOT EXISTS {{ ?st <urn:olaf:extractedFrom> ?chunk }}
+        }} }}
+        """)
+        await self._ex.execute_update(f"""
+        DELETE {{ GRAPH <{graph}> {{ ?st <{INFERRED_BY}> ?by }} }}
+        WHERE  {{ GRAPH <{graph}> {{ ?st <{INFERRED_BY}> ?by }} }}
+        """)
+        return count
+
+    async def inferences_store(self, ontology_id: str, triples: list[tuple[str, str, str]], by: str) -> int:
+        """Replace the materialized inferences with `triples` (subject, predicate, object
+        term), each marked as inferred by `by`. Returns how many were stored."""
+        graph = self._graph(ontology_id)
+        await self.inferences_clear(ontology_id)
+        for start in range(0, len(triples), 200):
+            lines = []
+            for s, p, o in triples[start : start + 200]:
+                stmt = _stmt_uri(s, p, o)
+                lines.append(f"<{s}> <{p}> {o} .")
+                lines.append(
+                    f"<{stmt}> a rdf:Statement ; rdf:subject <{s}> ; rdf:predicate <{p}> ; "
+                    f'rdf:object {o} ; <{INFERRED_BY}> "{_esc(by)}" .'
+                )
+            body = "\n                ".join(lines)
+            await self._ex.execute_update(f"""
+            {_PREFIXES}
+            INSERT DATA {{ GRAPH <{graph}> {{
+                {body}
+            }} }}
+            """)
+        return len(triples)
 
     # ── Summary ───────────────────────────────────────────────────────────
 
@@ -1300,5 +1679,8 @@ class OntologyStore:
         return {
             "active_ontology": ontology_id,
             **counts,
+            "inferred_triples": len(await self.inferences_list(ontology_id)),
+            # Since the server started; later changes are not reflected until the next check.
+            "last_check": self._last_check.get(ontology_id),
             "root_classes": root_classes,
         }

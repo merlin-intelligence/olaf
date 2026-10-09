@@ -1,8 +1,11 @@
 """
-olaf_reasoning_agent — LLM agent that repairs the logical problems of an existing OWL/RDFS ontology,
-using the OLAF reasoner (`ontology_check`) + LiteLLM.
+olaf_reasoning_agent — LLM agent that curates an existing OWL/RDFS ontology: merges duplicates,
+repairs its logical problems, adds missing disjointness, then reviews and materializes what it
+entails, using the OLAF reasoner (`ontology_check`, `ontology_infer`) + LiteLLM.
 
-The code drives the repair; the LLM only decides and applies the fixes:
+The code drives the work; the LLM only decides and applies the changes:
+  0. Deduplication (`dedup = true`) — classes whose concept embeddings are closer than
+     `dedup_threshold` are reviewed by pairs: merge or keep.
   1. `ontology_check` (Pellet: inconsistency, unsatisfiable classes; SPARQL: subclass cycles,
      domain/range violations, untyped individuals, property misuse) and `ontology_orphans` run.
   2. The problems are split into groups of `problems_per_task`. For each group the code gathers
@@ -12,6 +15,13 @@ The code drives the repair; the LLM only decides and applies the fixes:
      them with a few write tools (relation_delete, property_update, …) and searches only for what
      the context misses. The ontology is backed up to `backup_dir` before the first change.
   3. The check runs again, for up to `max_rounds` rounds, until nothing is left or nothing changes.
+  4. Enrichment (`enrich_disjointness = true`, once the ontology is consistent) — groups of sibling
+     classes with pairs not declared disjoint are handed to the LLM, which declares those that
+     exclude each other. The check runs again: a disjointness that contradicts an axiom shows up.
+  5. Once the ontology is consistent (`infer = true`): the inferences of the reasoner not yet
+     materialized are reviewed by the LLM by groups of `inferences_per_task`, each with why it
+     holds — an absurd one reveals a wrong axiom, which it fixes. The check runs again, then the
+     inferences are written into the ontology, marked as inferred.
 
 Usage:
     python agent.py                      # uses config.toml in current directory
@@ -21,123 +31,41 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
-import logging
 import os
 import re
 import sys
 import time
 import tomllib
 from dataclasses import dataclass, field
+from pathlib import Path
 
-import litellm
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
-from prompts import FIX_PROMPT, SYSTEM_PROMPT
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agent_common import LoopSettings, ToolLoop, logger, run, select_context, setup_logging  # noqa: E402
 
-logger = logging.getLogger(__name__)
+from prompts import DEDUP_PROMPT, ENRICH_PROMPT, FIX_PROMPT, REVIEW_PROMPT, SYSTEM_PROMPT  # noqa: E402
 
 # Tools the LLM may use to fix problems: the writes, plus targeted reads for what the task
 # context does not cover (e.g. finding where to attach an orphan). Everything else is hidden
 # and refused.
 FIX_TOOLS = {
     "relation_delete", "relation_add", "property_update", "concept_update", "concept_merge",
+    "restriction_delete", "entity_delete", "disjoint_add",
     "concept_get", "property_get", "relation_search", "concept_search",
 }
 
 RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 RDFS = "http://www.w3.org/2000/01/rdf-schema#"
+OWL = "http://www.w3.org/2002/07/owl#"
 # Types that say what kind of term an entity is, not which class it belongs to.
 _META_TYPES = (
     "http://www.w3.org/2002/07/owl#Class", "http://www.w3.org/2002/07/owl#NamedIndividual",
     "http://www.w3.org/2002/07/owl#ObjectProperty", "http://www.w3.org/2002/07/owl#DatatypeProperty",
     "http://www.w3.org/2002/07/owl#Thing",
 )
-
-
-def _endpoint_kwargs(llm_cfg: dict) -> dict:
-    """Optional custom endpoint for OpenAI-compatible providers (Scaleway, vLLM, …).
-    The key is read from the env var named by api_key_env, never stored in the config."""
-    kwargs = {}
-    if llm_cfg.get("api_base"):
-        kwargs["api_base"] = llm_cfg["api_base"]
-    if llm_cfg.get("api_key_env"):
-        key = os.environ.get(llm_cfg["api_key_env"])
-        if not key:
-            raise SystemExit(f"Environment variable {llm_cfg['api_key_env']} is not set.")
-        kwargs["api_key"] = key
-    return kwargs
-
-
-# Errors worth retrying as-is: the provider was slow or briefly unavailable.
-_TRANSIENT_ERRORS = (
-    litellm.Timeout,
-    litellm.APIConnectionError,
-    litellm.InternalServerError,
-    litellm.ServiceUnavailableError,
-)
-
-
-def _completion(llm_cfg: dict, **kwargs):
-    """litellm.completion, retried on rate limits (HTTP 429) with a growing wait — quotas
-    are usually per minute, so the wait goes up to a full minute — and on transient errors
-    (timeout, connection, 5xx), which are retried a few times after a short pause."""
-    rate_limit_retries = llm_cfg.get("rate_limit_retries", 6)
-    transient_retries = llm_cfg.get("transient_retries", 2)
-    rate_limited = transient = 0
-    while True:
-        try:
-            return litellm.completion(**kwargs, **_endpoint_kwargs(llm_cfg))
-        except litellm.RateLimitError:
-            if rate_limited == rate_limit_retries:
-                raise
-            wait = min(15 * 2 ** rate_limited, 60)
-            rate_limited += 1
-            logger.warning(
-                "Rate limited by the LLM provider — retrying in %ds (%d/%d).", wait, rate_limited, rate_limit_retries
-            )
-            time.sleep(wait)
-        except _TRANSIENT_ERRORS as exc:
-            if transient == transient_retries:
-                raise
-            transient += 1
-            logger.warning(
-                "LLM call failed (%s) — retrying in 10s (%d/%d).", type(exc).__name__, transient, transient_retries
-            )
-            time.sleep(10)
-
-
-def mcp_tools_to_litellm(mcp_tools: list) -> list[dict]:
-    """Convert MCP tool definitions to the OpenAI function-calling format used by LiteLLM."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description or "",
-                "parameters": t.inputSchema,
-            },
-        }
-        for t in mcp_tools
-    ]
-
-
-def prune_history(messages: list[dict], keep_recent_turns: int, pruned_chars: int) -> list[dict]:
-    """Copy of `messages` to send to the LLM: tool results older than the last
-    `keep_recent_turns` turns (assistant message + its tool results) are cut to a
-    `pruned_chars` preview. The task message, which holds the context, is never pruned."""
-    starts = [i for i, m in enumerate(messages) if m["role"] == "assistant" and m.get("tool_calls")]
-    keep = max(1, keep_recent_turns)
-    cutoff = starts[-keep] if len(starts) > keep else 0
-    pruned = []
-    for i, m in enumerate(messages):
-        content = m.get("content") or ""
-        if i < cutoff and m["role"] == "tool" and len(content) > pruned_chars:
-            m = {**m, "content": content[:pruned_chars] + f"\n… [pruned from context: {len(content)} chars]"}
-        pruned.append(m)
-    return pruned
 
 
 def _local(uri: str) -> str:
@@ -167,7 +95,6 @@ class Problem:
 class ReasoningAgent:
     def __init__(self, session: ClientSession, config: dict, mcp_tools: list):
         self.session = session
-        self.llm_cfg = config["litellm"]
         self.ontology_id = config["olaf"]["ontology_id"]
         self.graph = f"urn:olaf:{self.ontology_id}"
         agent_cfg = config.get("agent", {})
@@ -175,17 +102,32 @@ class ReasoningAgent:
         self.problems_per_task = agent_cfg.get("problems_per_task", 5)
         self.fix_orphans = agent_cfg.get("fix_orphans", True)
         self.include_seeds = agent_cfg.get("include_seeds", False)
-        self.max_iterations = agent_cfg.get("max_iterations", 12)
         self.max_source_chunks = agent_cfg.get("max_source_chunks", 8)
         self.max_chunk_chars = agent_cfg.get("max_chunk_chars", 2500)
         self.max_entities = agent_cfg.get("max_entities_per_task", 25)
-        self.max_tool_result_chars = agent_cfg.get("max_tool_result_chars", 20_000)
-        self.keep_recent_turns = agent_cfg.get("keep_recent_turns", 6)
-        self.pruned_result_chars = agent_cfg.get("pruned_result_chars", 500)
         self.export_path: str | None = agent_cfg.get("export_path")
         self.backup_dir: str | None = agent_cfg.get("backup_dir", "backups")
+        self.infer = agent_cfg.get("infer", True)
+        self.review_inferences = agent_cfg.get("review_inferences", True)
+        self.inferences_per_task = agent_cfg.get("inferences_per_task", 10)
+        self.max_explained = agent_cfg.get("max_explained_inferences", 20)
+        self.dedup = agent_cfg.get("dedup", True)
+        self.dedup_threshold = agent_cfg.get("dedup_threshold", 0.9)
+        self.dedup_pairs_per_task = agent_cfg.get("dedup_pairs_per_task", 20)
+        self.enrich_disjointness = agent_cfg.get("enrich_disjointness", True)
+        self.sibling_groups_per_task = agent_cfg.get("sibling_groups_per_task", 4)
+        self.max_siblings_per_group = agent_cfg.get("max_siblings_per_group", 15)
+        self._backed_up = False
+        # Problems the last check left unfixed: not handed over again unless something changed.
+        self._unresolved: set | None = None
+        # Disjointness axioms the enrichment declared in this run, as stored (a disjointWith b):
+        # flagged as the likely culprit when they appear in an explanation.
+        self._added_disjoint: set[tuple[str, str]] = set()
 
-        self.tools = mcp_tools_to_litellm([t for t in mcp_tools if t.name in FIX_TOOLS])
+        self.loop = ToolLoop(
+            session, config["litellm"], mcp_tools, allowed=FIX_TOOLS,
+            settings=LoopSettings.from_config(agent_cfg, max_iterations=12, keep_recent_turns=6),
+        )
         self.system_prompt = SYSTEM_PROMPT.format(graph=self.graph)
         self._entity_cache: dict[str, dict | None] = {}
 
@@ -206,81 +148,6 @@ class ReasoningAgent:
         except (RuntimeError, json.JSONDecodeError) as exc:
             logger.debug("Context lookup %s(%s) failed: %s", tool_name, args, exc)
             return None
-
-    async def _llm_tool_call(self, tool_name: str, raw_args: str) -> str:
-        """Tool call requested by the LLM; errors are returned to it so it can adapt."""
-        try:
-            tool_args = json.loads(raw_args) if raw_args else {}
-        except json.JSONDecodeError:
-            return f"Error: invalid JSON arguments: {raw_args}"
-        if tool_name not in FIX_TOOLS:
-            return f"Error: {tool_name} is not available for this task."
-
-        logger.info("Tool call: %s(%s)", tool_name, _summarise(tool_args))
-        try:
-            result = await self.session.call_tool(tool_name, tool_args)
-            content = result.content[0].text if result.content else ""
-        except Exception as exc:
-            logger.warning("Tool %s failed: %s", tool_name, exc)
-            return f"Error: {exc}"
-
-        logger.debug("  → %s", content[:200])
-        if len(content) > self.max_tool_result_chars:
-            content = content[: self.max_tool_result_chars] + f"\n… [truncated: {len(content)} chars in total]"
-        return content
-
-    async def converse(self, task: str, label: str) -> str:
-        """One task = one fresh conversation: the LLM calls tools until it replies with a
-        plain-text summary. Returns that summary."""
-        messages: list[dict] = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": task},
-        ]
-        logger.debug("[%s] task:\n%s", label, task)
-        for iteration in range(1, self.max_iterations + 1):
-            logger.info("[%s] iteration %d", label, iteration)
-            response = await asyncio.to_thread(
-                _completion,
-                self.llm_cfg,
-                model=self.llm_cfg["model"],
-                messages=prune_history(messages, self.keep_recent_turns, self.pruned_result_chars),
-                tools=self.tools,
-                tool_choice="auto",
-                max_tokens=self.llm_cfg.get("max_tokens", 4096),
-                temperature=self.llm_cfg.get("temperature", 0),
-                timeout=self.llm_cfg.get("timeout", 120),
-            )
-            msg = response.choices[0].message
-
-            if not msg.tool_calls:
-                summary = (msg.content or "").strip()
-                logger.info("[%s] done: %s", label, summary[:1000])
-                return summary
-            if msg.content and msg.content.strip():
-                logger.info("[%s] %s", label, msg.content.strip()[:500])
-
-            messages.append({
-                "role": "assistant",
-                "content": msg.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in msg.tool_calls
-                ],
-            })
-            for tc in msg.tool_calls:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "name": tc.function.name,
-                    "content": await self._llm_tool_call(tc.function.name, tc.function.arguments),
-                })
-
-        logger.warning("[%s] reached max_iterations (%d) — task stopped.", label, self.max_iterations)
-        return ""
 
     # ── Problems from the check report ────────────────────────────────────
 
@@ -303,8 +170,20 @@ class ReasoningAgent:
                 uris.extend(v if isinstance(v, list) else [v])
             return uris
 
+        added = {frozenset((_local(a), _local(b))): (a, b) for a, b in self._added_disjoint}
+
         def explanation(expl: list[list[str]]) -> str:
-            return "\n".join(f"  - `{axiom}`" for axioms in expl[:1] for axiom in axioms)
+            lines = []
+            for axiom in (a for axioms in expl[:1] for a in axioms):
+                lines.append(f"  - `{axiom}`")
+                m = re.fullmatch(r"(\S+) disjointWith (\S+)", axiom.strip())
+                if m and (pair := added.get(frozenset(m.groups()))):
+                    lines.append(
+                        f"    ⚠ declared by the enrichment of this run — the likely wrong axiom: undo with "
+                        f"relation_delete(subject_uri=`{pair[0]}`, property_uri=`{OWL}disjointWith`, "
+                        f"object_value=`{pair[1]}`) unless the text says they exclude each other"
+                    )
+            return "\n".join(lines)
 
         if inc := reasoner.get("inconsistency"):
             out.append(Problem(
@@ -351,13 +230,24 @@ class ReasoningAgent:
                 entities=[v["subject"], v["property"]],
                 triples=[(v["subject"], v["property"], v["object"])],
             ))
+        for v in integrity.get("unknown_terms", []):
+            hint = f" — the closest real term is `{v['suggestion']}`" if v.get("suggestion") else ""
+            out.append(Problem(
+                "unknown_term",
+                f"**Unknown vocabulary term** — `{v['subject']}` `{v['property']}` `{v['object']}` uses "
+                f"`{v['term']}`, which its vocabulary does not define{hint}.",
+                entities=[v["subject"], v["object"]] if v["object"].startswith("http") else [v["subject"]],
+                triples=[(v["subject"], v["property"], v["object"])],
+            ))
         for uri in integrity.get("untyped_individuals", []):
             out.append(Problem("untyped", f"**Untyped individual** `{uri}` — it has no class.", entities=[uri]))
 
         if self.fix_orphans:
             for o in orphans:
                 out.append(Problem(
-                    "orphan", f"**Orphan {o['kind']}** `{o['uri']}` (\"{o['label']}\") — no relation to the rest.",
+                    "orphan",
+                    f"**Orphan {o['kind']}** `{o['uri']}` (\"{o['label']}\") — no relation to the rest. Connect it "
+                    "only if the source text says explicitly what it is; otherwise leave it.",
                     entities=[o["uri"]],
                 ))
         return out
@@ -426,9 +316,13 @@ class ReasoningAgent:
                 details.append(f"{name}: {', '.join(values)}")
         if ancestors:
             details.append(f"ancestors: {', '.join(_local(a) for a in ancestors)}")
+        for r in e.get("restrictions", []):
+            target = r.get("value") or ""
+            card = f" {r['cardinality']}" if "cardinality" in r else ""
+            details.append(f"restriction: {_local(r['property'])} {r['restriction_type']}{card} {_local(target)}".rstrip())
         return " ".join(parts) + (f" [{'; '.join(details)}]" if details else "")
 
-    async def context(self, group: list[Problem]) -> tuple[str, str]:
+    async def context(self, group: list[Problem], heading: str = "Problem", with_sources: bool = True) -> tuple[str, str]:
         """Problems text with the involved entities described, and the source chunk texts."""
         entities: list[str] = []
         for p in group:
@@ -444,12 +338,12 @@ class ReasoningAgent:
         for uri in entities:
             e = await self._entity(uri)
             chunk_ids.extend(i for i in (e or {}).get("source_chunk_ids", []) if i not in chunk_ids)
-        chunk_ids = chunk_ids[: self.max_source_chunks]
+        chunk_ids = chunk_ids[: self.max_source_chunks] if with_sources else []
 
         ancestors = await self._ancestors(entities) if entities else {}
         blocks = []
         for i, p in enumerate(group, 1):
-            text = f"### Problem {i}\n{p.text}"
+            text = f"### {heading} {i}\n{p.text}"
             if p.violation:
                 text += "\n" + await self._violation_hint(p.violation, p.kind, ancestors)
             blocks.append(text)
@@ -490,36 +384,245 @@ class ReasoningAgent:
             f.write(await self._call("ontology_export"))
         logger.info("Backup of the ontology before any change: %s", path)
 
-    async def run(self) -> None:
-        previous: set | None = None
-        backed_up = False
+    async def _ensure_backup(self) -> None:
+        if self.backup_dir and not self._backed_up:
+            await self.backup()
+            self._backed_up = True
+
+    async def repair(self, label: str = "Round") -> bool:
+        """Check → fix → check again, for up to max_rounds rounds. Returns whether the
+        ontology is consistent at the end."""
         for round_number in range(1, self.max_rounds + 1):
             self._entity_cache.clear()
             report, orphans = await self.check()
             problems = await self.problems(report, orphans)
-            _log_report(f"Round {round_number}", report, orphans)
+            _log_report(f"{label} {round_number}", report, orphans)
+            keys = {p.key for p in problems}
             if not problems:
                 logger.info("Nothing left to fix.")
+                self._unresolved = keys
                 break
-            keys = {p.key for p in problems}
-            if keys == previous:
-                logger.warning("The last round changed nothing — stopping with %d problem(s) left.", len(problems))
+            if keys == self._unresolved:
+                logger.warning("Nothing changed since the last fixes — stopping with %d problem(s) left.", len(problems))
                 break
-            previous = keys
-            if self.backup_dir and not backed_up:
-                await self.backup()
-                backed_up = True
+            self._unresolved = keys
+            await self._ensure_backup()
 
             groups = [problems[i : i + self.problems_per_task] for i in range(0, len(problems), self.problems_per_task)]
             for n, group in enumerate(groups, 1):
                 problems_text, sources = await self.context(group)
-                await self.converse(
+                await self.loop.task(
+                    self.system_prompt,
                     FIX_PROMPT.format(count=len(group), problems=problems_text, sources=sources),
-                    f"round {round_number} · task {n}/{len(groups)}",
+                    f"{label.lower()} {round_number} · task {n}/{len(groups)}",
                 )
         else:
             report, orphans = await self.check()
             _log_report("Final", report, orphans)
+            self._unresolved = {p.key for p in await self.problems(report, orphans)}
+        return report.get("reasoner", {}).get("consistent") is not False
+
+    # ── Inferences ────────────────────────────────────────────────────────
+
+    async def _preview_inferences(self) -> list[dict] | None:
+        try:
+            preview = json.loads(await self._call("ontology_infer", {
+                "action": "preview", "include_seeds": self.include_seeds, "max_explained": self.max_explained,
+            }))
+        except RuntimeError as exc:
+            logger.warning("Inference skipped: %s", exc)
+            return None
+        items = preview["inferences"]
+        logger.info(
+            "Inferences: %d entailed but not asserted — %d from the class hierarchy alone, %d already materialized by an earlier run.",
+            len(items), sum(i["taxonomic"] for i in items), sum(i["materialized"] for i in items),
+        )
+        return items
+
+    async def _parent_counts(self, uris: list[str]) -> dict[str, int]:
+        """Number of named superclasses each class has (asserted)."""
+        if not uris:
+            return {}
+        rows = (await self._try_json("sparql_query", {"limit": 1000, "query": f"""
+            PREFIX rdfs: <{RDFS}>
+            SELECT ?c (COUNT(DISTINCT ?p) AS ?n) WHERE {{ GRAPH <{self.graph}> {{
+                VALUES ?c {{ {" ".join(f"<{u}>" for u in uris)} }}
+                ?c rdfs:subClassOf ?p . FILTER(isIRI(?p))
+            }} }} GROUP BY ?c"""}) or {}).get("rows", [])
+        return {r["c"]: int(r["n"] or 0) for r in rows}
+
+    @staticmethod
+    def _inference_problem(item: dict, parent_counts: dict[str, int]) -> Problem:
+        s, p, o = item["subject"], item["predicate"], item["object"]
+        names = item.get("entities", {})
+        lines = []
+        for axiom in (a for axioms in item["explanations"][:1] for a in axioms):
+            note = ""
+            m = re.fullmatch(r"(\S+) subClassOf (\S+)", axiom.strip())
+            if m and isinstance(sub := names.get(m.group(1)), str) and parent_counts.get(sub) == 1:
+                note = f" — the only parent of {m.group(1)}: deleting it leaves {m.group(1)} without any parent"
+            lines.append(f"  - `{axiom}`{note}")
+        why = "\n".join(lines)
+        origin = "from the class hierarchy alone" if item["taxonomic"] else "involving domains, ranges, equivalences…"
+        text = (f"**Inference** `{s}` `{p}` `{o}` ({origin})\n"
+                + (f"Because of:\n{why}" if why else "(no explanation computed)"))
+        entities = [s, o]
+        for v in item.get("entities", {}).values():
+            entities.extend(u for u in (v if isinstance(v, list) else [v]) if u not in entities)
+        return Problem("inference", text, entities=entities)
+
+    async def review(self, items: list[dict]) -> None:
+        """Have the LLM read the new inferences: an absurd one reveals a wrong axiom in its
+        explanation, which it fixes. Inferences with the same object are kept together, as
+        they often come from the same axiom."""
+        items = sorted(items, key=lambda i: (i["object"], i["predicate"], i["subject"]))
+        groups = [items[i : i + self.inferences_per_task] for i in range(0, len(items), self.inferences_per_task)]
+        for n, group in enumerate(groups, 1):
+            self._entity_cache.clear()
+            subjects = sorted({u for i in group for name, u in i.get("entities", {}).items()
+                               if isinstance(u, str) and any(
+                                   a.strip().startswith(f"{name} subClassOf ") for ax in i["explanations"][:1] for a in ax)})
+            counts = await self._parent_counts(subjects)
+            problems_text, sources = await self.context([self._inference_problem(i, counts) for i in group], "Inference")
+            await self.loop.task(
+                    self.system_prompt,
+                REVIEW_PROMPT.format(count=len(group), inferences=problems_text, sources=sources),
+                f"review · task {n}/{len(groups)}",
+            )
+
+    async def infer_and_materialize(self) -> None:
+        items = await self._preview_inferences()
+        if items is None:
+            return
+        to_review = [i for i in items if not i["materialized"]]
+        if self.review_inferences and to_review:
+            await self._ensure_backup()
+            await self.review(to_review)
+            # The review may have changed axioms: check again before materializing.
+            if not await self.repair(label="After review"):
+                logger.warning("The ontology is inconsistent after the review — inferences not materialized.")
+                return
+        await self._ensure_backup()
+        result = json.loads(await self._call("ontology_infer", {"action": "materialize", "include_seeds": self.include_seeds}))
+        logger.info("Inferences materialized: %d (replacing %d).", result["stored"], result["replaced"])
+
+    # ── Deduplication ─────────────────────────────────────────────────────
+
+    async def deduplicate(self) -> None:
+        """Pairs of classes whose concept embeddings are closer than dedup_threshold are
+        reviewed by the LLM, dedup_pairs_per_task at a time: merge or keep."""
+        classes = json.loads(await self._call("concept_list", {"limit": 100_000}))
+        by_uri = {c["uri"]: c for c in classes}
+        pairs: dict[tuple[str, str], float] = {}
+        for c in classes:
+            query = c["label"] + (f": {c['definition']}" if c.get("definition") else "")
+            try:
+                hits = json.loads(await self._call("concept_semantic_search", {"query": query, "top_k": 5}))
+            except RuntimeError as exc:
+                logger.warning("Deduplication skipped: %s", exc)
+                return
+            for h in hits:
+                if h["uri"] != c["uri"] and h["uri"] in by_uri and h["score"] >= self.dedup_threshold:
+                    key = tuple(sorted((c["uri"], h["uri"])))
+                    pairs[key] = max(pairs.get(key, 0.0), h["score"])
+
+        if not pairs:
+            logger.info("Deduplication: no candidate pairs above %.2f.", self.dedup_threshold)
+            return
+        logger.info("Deduplication: %d candidate pairs above %.2f.", len(pairs), self.dedup_threshold)
+        await self._ensure_backup()
+
+        def describe(uri: str) -> str:
+            c = by_uri[uri]
+            definition = (c.get("definition") or "")[:200]
+            return f'"{c["label"]}" <{uri}>' + (f" — {definition}" if definition else "")
+
+        ordered = sorted(pairs.items(), key=lambda kv: -kv[1])
+        for start in range(0, len(ordered), self.dedup_pairs_per_task):
+            group = ordered[start : start + self.dedup_pairs_per_task]
+            text = "\n".join(f"- score {score:.3f}\n  A: {describe(a)}\n  B: {describe(b)}" for (a, b), score in group)
+            await self.loop.task(
+                self.system_prompt, DEDUP_PROMPT.format(pairs=text),
+                f"dedup · task {start // self.dedup_pairs_per_task + 1}",
+            )
+
+    # ── Enrichment: disjointness ──────────────────────────────────────────
+
+    async def _sibling_groups(self) -> list[tuple[str, list[str]]]:
+        """(parent, children) of the classes that share a parent (or are all roots) and have
+        at least one pair neither disjoint nor in a subclass relation."""
+        rows = (await self._try_json("sparql_query", {"limit": 1000, "query": f"""
+            PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}>
+            SELECT ?c ?parent WHERE {{ GRAPH <{self.graph}> {{
+                ?c a owl:Class . FILTER(isIRI(?c))
+                OPTIONAL {{ ?c rdfs:subClassOf ?parent . FILTER(isIRI(?parent) && ?parent != owl:Thing && ?parent != ?c) }}
+            }} }}"""}) or {}).get("rows", [])
+        related = (await self._try_json("sparql_query", {"limit": 1000, "query": f"""
+            PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}>
+            SELECT ?a ?b WHERE {{ GRAPH <{self.graph}> {{
+                {{ ?a owl:disjointWith ?b }} UNION {{ ?a rdfs:subClassOf+ ?b . FILTER(isIRI(?b)) }}
+            }} }}"""}) or {}).get("rows", [])
+        excluded = {frozenset((r["a"], r["b"])) for r in related}
+
+        children: dict[str, list[str]] = {}
+        for r in rows:
+            parent = r["parent"] or "(root classes)"
+            if r["c"] not in children.setdefault(parent, []):
+                children[parent].append(r["c"])
+        groups = []
+        for parent, kids in sorted(children.items()):
+            for start in range(0, len(kids), self.max_siblings_per_group):
+                chunk = sorted(kids)[start : start + self.max_siblings_per_group]
+                if any(frozenset((a, b)) not in excluded for i, a in enumerate(chunk) for b in chunk[i + 1:]):
+                    groups.append((parent, chunk))
+        return groups
+
+    async def _disjoint_pairs(self) -> set[tuple[str, str]]:
+        rows = (await self._try_json("sparql_query", {"limit": 1000, "query": f"""
+            PREFIX owl: <{OWL}>
+            SELECT ?a ?b WHERE {{ GRAPH <{self.graph}> {{ ?a owl:disjointWith ?b }} }}"""}) or {}).get("rows", [])
+        return {(r["a"], r["b"]) for r in rows}
+
+    async def enrich(self) -> bool:
+        """Have the LLM declare disjoint sibling classes. Returns whether it was asked."""
+        groups = [g for g in await self._sibling_groups() if len(g[1]) >= 2]
+        if not groups:
+            logger.info("Enrichment: no sibling classes left to examine.")
+            return False
+        logger.info("Enrichment: %d groups of sibling classes to examine for disjointness.", len(groups))
+        await self._ensure_backup()
+        before = await self._disjoint_pairs()
+        per_task = self.sibling_groups_per_task
+        for n, start in enumerate(range(0, len(groups), per_task), 1):
+            self._entity_cache.clear()
+            blocks = []
+            for parent, kids in groups[start : start + per_task]:
+                parent_name = parent if parent.startswith("(") else f"subclasses of `{parent}`"
+                problem = Problem("siblings", f"Siblings — {parent_name}", entities=kids)
+                text, _ = await self.context([problem], heading="Group", with_sources=False)
+                blocks.append(text.replace("### Group 1", "###", 1))
+            await self.loop.task(
+                self.system_prompt, ENRICH_PROMPT.format(groups="\n\n".join(blocks)),
+                f"enrich · task {n}/{-(-len(groups) // per_task)}",
+            )
+        added = await self._disjoint_pairs() - before
+        self._added_disjoint |= added
+        logger.info("Enrichment: %d disjoint pairs declared.", len(added))
+        return True
+
+    # ── Run ───────────────────────────────────────────────────────────────
+
+    async def run(self) -> None:
+        if self.dedup:
+            await self.deduplicate()
+        consistent = await self.repair()
+        if self.enrich_disjointness and consistent and await self.enrich():
+            consistent = await self.repair(label="After enrichment")
+        if self.infer:
+            if consistent:
+                await self.infer_and_materialize()
+            else:
+                logger.warning("The ontology is still inconsistent — nothing can be inferred from it.")
 
         if self.export_path:
             with open(self.export_path, "w", encoding="utf-8") as f:
@@ -531,49 +634,15 @@ def _log_report(label: str, report: dict, orphans: list[dict]) -> None:
     r, it = report.get("reasoner", {}), report.get("integrity", {})
     logger.info(
         "%s — consistent: %s, unsatisfiable: %d, classes in cycles: %d, domain: %d, range: %d, untyped: %d, "
-        "kind: %d, orphans: %d",
+        "kind: %d, unknown terms: %d, orphans: %d",
         label, r.get("consistent", "?"), len(r.get("unsatisfiable_classes") or []),
         len(it.get("subclass_cycles", [])), len(it.get("domain_violations", [])),
         len(it.get("range_violations", [])), len(it.get("untyped_individuals", [])),
-        len(it.get("property_kind_mismatches", [])), len(orphans),
+        len(it.get("property_kind_mismatches", [])), len(it.get("unknown_terms", [])), len(orphans),
     )
 
 
-def _summarise(args: dict) -> str:
-    """One-line representation of tool arguments for logging. URIs are kept whole, so that
-    every change can be read (and undone) from the log; long texts are shortened."""
-    parts = []
-    for k, v in args.items():
-        s = str(v)
-        parts.append(f"{k}={s[:120]!r}…" if len(s) > 120 and not s.startswith("http") else f"{k}={s!r}")
-    return ", ".join(parts)
-
-
 # ─── Entry point ──────────────────────────────────────────────────────────────
-
-
-async def _call_or_exit(session: ClientSession, tool_name: str, args: dict) -> str:
-    result = await session.call_tool(tool_name, args)
-    text = result.content[0].text if result.content else ""
-    if text.startswith("Error"):
-        raise SystemExit(f"{tool_name} failed: {text}")
-    return text
-
-
-async def select_context(session: ClientSession, olaf_cfg: dict) -> None:
-    """Activate the configured ontology (it must exist) and select the chunk collection the
-    source texts are read from. Session state only: other agents on the same server are unaffected."""
-    await _call_or_exit(session, "ontology_switch", {"ontology_id": olaf_cfg["ontology_id"]})
-    logger.info("Active ontology: %s", olaf_cfg["ontology_id"])
-
-    if collection := olaf_cfg.get("collection"):
-        args: dict = {"collection": collection}
-        if olaf_cfg.get("field_mapping"):
-            args["field_mapping"] = olaf_cfg["field_mapping"]
-        await _call_or_exit(session, "chunk_collection_switch", args)
-        logger.info("Chunk collection: %s", collection)
-    else:
-        logger.info("Chunk collection: server default ([qdrant].collection)")
 
 
 async def main_async(config: dict) -> None:
@@ -589,29 +658,9 @@ async def main_async(config: dict) -> None:
             await ReasoningAgent(session, config, tools_result.tools).run()
 
 
-def _run(coro) -> None:
-    """asyncio.run, but a SystemExit raised inside the MCP session (wrapped by anyio in an
-    exception group) exits with its message instead of a long traceback."""
-    def first_exit(group: BaseExceptionGroup) -> SystemExit | None:
-        for exc in group.exceptions:
-            found = exc if isinstance(exc, SystemExit) else (
-                first_exit(exc) if isinstance(exc, BaseExceptionGroup) else None
-            )
-            if found:
-                return found
-        return None
-
-    try:
-        asyncio.run(coro)
-    except BaseExceptionGroup as group:
-        if exit_exc := first_exit(group):
-            raise exit_exc from None
-        raise
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="olaf_reasoning_agent — repair the logical problems of an ontology"
+        description="olaf_reasoning_agent — curate an ontology: dedup, repair, enrich, infer"
     )
     parser.add_argument("--config", default="config.toml", help="Path to config.toml")
     parser.add_argument("--log-level", default=None, help="DEBUG / INFO / WARNING")
@@ -620,18 +669,8 @@ def main() -> None:
     with open(args.config, "rb") as f:
         config = tomllib.load(f)
 
-    log_level = args.log_level or config.get("agent", {}).get("log_level", "INFO")
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)-8s %(message)s",
-        datefmt="%H:%M:%S",
-        stream=sys.stderr,
-    )
-    # Library debug output (full LLM requests, HTTP traces) drowns the agent's own log.
-    for noisy in ("LiteLLM", "litellm", "httpx", "httpcore", "mcp", "openai"):
-        logging.getLogger(noisy).setLevel(max(logging.INFO, logging.getLogger().level))
-
-    _run(main_async(config))
+    setup_logging(args.log_level or config.get("agent", {}).get("log_level", "INFO"))
+    run(main_async(config))
 
 
 if __name__ == "__main__":

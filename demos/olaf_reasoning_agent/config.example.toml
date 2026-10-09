@@ -47,6 +47,13 @@ transient_retries = 2
 
 
 [agent]
+# ── Deduplication (first) ──
+# Pairs of classes whose concept embeddings are this similar are reviewed by the LLM: merge or
+# keep. Needs embeddings on the server ([embedding] enabled = true); skipped otherwise.
+dedup                = true
+dedup_threshold      = 0.9   # min semantic similarity for a pair of classes to be reviewed
+dedup_pairs_per_task = 20    # candidate pairs reviewed per LLM conversation
+
 # Check → fix → check again, for up to this many rounds. The run also stops as soon as nothing
 # is left, or when a round changed nothing. Several rounds are often needed: the reasoner only
 # lists unsatisfiable classes once the ontology is consistent.
@@ -63,6 +70,25 @@ include_seeds = false
 
 # Max LLM ↔ tool rounds per task — the context is given upfront, searches are for what it misses
 max_iterations = 12
+
+# ── Enrichment: disjointness (once the ontology is consistent) ──
+# Groups of sibling classes with pairs not declared disjoint are handed to the LLM, which declares
+# those that exclude each other — what lets the reasoner detect contradictions. The check runs
+# again afterwards. Groups it leaves alone are proposed again on the next run.
+enrich_disjointness     = true
+sibling_groups_per_task = 4    # groups of siblings per LLM conversation
+max_siblings_per_group  = 15   # larger sibling sets (e.g. the root classes) are split
+
+# ── Inference (once the ontology is consistent) ──
+# Review what the reasoner infers, then write it into the ontology, marked as inferred
+# (<urn:olaf:inferredBy>; ontology_check ignores these triples).
+infer = true
+# Have the LLM read the inferences not materialized yet: an absurd one reveals a wrong axiom,
+# which it fixes. false = materialize without review.
+review_inferences = true
+inferences_per_task      = 10   # inferences per LLM conversation (kept together when they share an object)
+max_explained_inferences = 20   # inferences explained by the reasoner (one JVM run each); those
+                                # following from the class hierarchy alone are explained for free
 
 # ── Context given with each task ──
 max_source_chunks     = 8      # source chunks per task (those of the axioms at stake first)

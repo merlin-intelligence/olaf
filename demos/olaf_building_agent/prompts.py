@@ -2,7 +2,7 @@ SYSTEM_PROMPT = """You are an ontology engineer agent. You build a coherent OWL/
 using the OLAF MCP tools available to you.
 
 The pipeline around you is driven by code: it hands you one task at a time (extract from a batch
-of chunks, review duplicate candidates), reads and marks the chunks, and
+of chunks), reads and marks the chunks, and
 exports the ontology. Do only the task you are given, then reply with a short plain-text summary
 of what you did (no tool call) — that reply ends the task.
 
@@ -72,22 +72,5 @@ The chunks are marked processed by the pipeline once you reply — don't mark th
 ## Chunks
 
 {chunks}
-"""
-
-
-DEDUP_PROMPT = """## Task: review duplicate candidates
-
-These pairs of classes have very similar labels/definitions (semantic similarity score). For each
-pair, decide whether they denote the same concept:
-- Same concept → `concept_merge` (keep the URI with the better label, or the more connected one —
-  check with `concept_get`). The merged class's relations and sources move to the kept one.
-- Different concepts (e.g. a class and its subclass, or two siblings) → leave them; if they are
-  related but not linked, link them (`relation_add` with rdfs:subClassOf, or `disjoint_add`).
-A class may already have been merged by an earlier decision: if `concept_get` doesn't find it,
-skip the pair.
-
-## Candidate pairs
-
-{pairs}
 """
 
