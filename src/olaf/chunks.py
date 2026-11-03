@@ -6,8 +6,6 @@ from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from .config import FieldMapping
 
-_STATUS_FIELD = "olaf_status"
-_PROCESSED_AT_FIELD = "olaf_processed_at"
 
 
 class ChunkStore:
@@ -16,18 +14,31 @@ class ChunkStore:
         url: str,
         collection: str,
         field_mapping: FieldMapping,
+        ontology_id: str,
         api_key: str | None = None,
         client: QdrantClient | None = None,
     ):
         self.client = client or QdrantClient(url=url, api_key=api_key)
         self.collection = collection
         self.fm = field_mapping
+        # Each ontology has its own status fields, so several ontologies can be built from the
+        # same collection, each with its own progress.
+        self.ontology_id = ontology_id
+        self.status_field = f"olaf_status_{ontology_id}"
+        self.processed_at_field = f"olaf_processed_at_{ontology_id}"
+        # Filter / delete paths are quoted: Qdrant reads an unquoted '.' (allowed in ids) as nesting.
+        self._status_key = f'"{self.status_field}"'
+        self._processed_at_key = f'"{self.processed_at_field}"'
 
     def for_collection(self, collection: str, field_mapping: FieldMapping | None = None) -> "ChunkStore":
         """A store on another collection of the same Qdrant instance, sharing the client."""
         if not self.client.collection_exists(collection):
             raise ValueError(f"Qdrant collection not found: {collection!r}")
-        return ChunkStore("", collection, field_mapping or self.fm, client=self.client)
+        return ChunkStore("", collection, field_mapping or self.fm, self.ontology_id, client=self.client)
+
+    def for_ontology(self, ontology_id: str) -> "ChunkStore":
+        """The same collection, tracking the processing status of another ontology."""
+        return ChunkStore("", self.collection, self.fm, ontology_id, client=self.client)
 
     def _to_dict(self, point) -> dict:
         p = point.payload or {}
@@ -38,8 +49,8 @@ class ChunkStore:
             "chunk_index": p.get(self.fm.chunk_index, 0),
             "text_preview": text[:200] + ("…" if len(text) > 200 else ""),
             "text_length": len(text),
-            "status": p.get(_STATUS_FIELD, "pending"),
-            "processed_at": p.get(_PROCESSED_AT_FIELD),
+            "status": p.get(self.status_field, "pending"),
+            "processed_at": p.get(self.processed_at_field),
         }
 
     def _parse_id(self, chunk_id: str) -> int | str:
@@ -61,9 +72,9 @@ class ChunkStore:
             must.append(FieldCondition(key=self.fm.doc_id, match=MatchValue(value=doc_id)))
         if status and status != "all":
             if status == "pending":
-                must_not.append(FieldCondition(key=_STATUS_FIELD, match=MatchValue(value="processed")))
+                must_not.append(FieldCondition(key=self._status_key, match=MatchValue(value="processed")))
             else:
-                must.append(FieldCondition(key=_STATUS_FIELD, match=MatchValue(value=status)))
+                must.append(FieldCondition(key=self._status_key, match=MatchValue(value=status)))
 
         scroll_filter = Filter(must=must if must else None, must_not=must_not if must_not else None)
         points, _ = self.client.scroll(
@@ -92,8 +103,8 @@ class ChunkStore:
             "doc_id": p.get(self.fm.doc_id, ""),
             "chunk_index": p.get(self.fm.chunk_index, 0),
             "text": text,
-            "status": p.get(_STATUS_FIELD, "pending"),
-            "processed_at": p.get(_PROCESSED_AT_FIELD),
+            "status": p.get(self.status_field, "pending"),
+            "processed_at": p.get(self.processed_at_field),
         }
 
     def get_chunks_batch(self, chunk_ids: list[str]) -> list[dict]:
@@ -118,7 +129,7 @@ class ChunkStore:
                     "doc_id": p.get(self.fm.doc_id, ""),
                     "chunk_index": p.get(self.fm.chunk_index, 0),
                     "text": text,
-                    "status": p.get(_STATUS_FIELD, "pending"),
+                    "status": p.get(self.status_field, "pending"),
                 })
         return output
 
@@ -127,8 +138,8 @@ class ChunkStore:
             self.client.set_payload(
                 collection_name=self.collection,
                 payload={
-                    _STATUS_FIELD: "processed",
-                    _PROCESSED_AT_FIELD: datetime.now(timezone.utc).isoformat(),
+                    self.status_field: "processed",
+                    self.processed_at_field: datetime.now(timezone.utc).isoformat(),
                 },
                 points=[self._parse_id(chunk_id)],
             )
@@ -137,9 +148,9 @@ class ChunkStore:
             return False
 
     def reset_processed(self, doc_id: str | None = None) -> int:
-        """Remove the olaf status fields from processed chunks (all, or one document's) so
+        """Remove this ontology's status fields from processed chunks (all, or one document's) so
         they are pending again. Other payload fields are untouched. Returns the reset count."""
-        must = [FieldCondition(key=_STATUS_FIELD, match=MatchValue(value="processed"))]
+        must = [FieldCondition(key=self._status_key, match=MatchValue(value="processed"))]
         if doc_id:
             must.append(FieldCondition(key=self.fm.doc_id, match=MatchValue(value=doc_id)))
         processed = Filter(must=must)
@@ -147,7 +158,7 @@ class ChunkStore:
         if count:
             self.client.delete_payload(
                 collection_name=self.collection,
-                keys=[_STATUS_FIELD, _PROCESSED_AT_FIELD],
+                keys=[self._status_key, self._processed_at_key],
                 points=processed,
             )
         return count
@@ -159,6 +170,6 @@ class ChunkStore:
         return self.client.count(
             collection_name=self.collection,
             count_filter=Filter(must=[
-                FieldCondition(key=_STATUS_FIELD, match=MatchValue(value="processed"))
+                FieldCondition(key=self._status_key, match=MatchValue(value="processed"))
             ]),
         ).count

@@ -13,7 +13,7 @@
 # └─────────────────────────────────────────────────────────────────┘
 
 # ── Qdrant ─────────────────────────────────────────────────────────────────────
-# Connection to Qdrant (chunk reading + status tracking). The connection is shared by
+# Connection to Qdrant (chunk reading + status tracking, one status per ontology). The connection is shared by
 # all connected agents; each agent picks its chunk collection in its own config
 # (chunk_collection_switch), `collection` / `field_mapping` below are only the defaults.
 
