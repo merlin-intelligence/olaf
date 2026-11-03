@@ -122,7 +122,7 @@ model   = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 enabled = true
 ```
 
-**The `olaf_status` and `olaf_processed_at` payload fields are added to your existing Qdrant points via `set_payload` — your other fields are never modified.**
+**The `olaf_status_{ontology_id}` and `olaf_processed_at_{ontology_id}` payload fields are added to your existing Qdrant points via `set_payload` — your other fields are never modified.** Each ontology has its own pair of fields, so several ontologies can be built from the same collection, each with its own progress, and resume where it stopped.
 
 ---
 
@@ -134,7 +134,7 @@ enabled = true
 |------|-------------|
 | `ontology_list` | List all ontologies in the store with id, name, base_uri, class count, and active flag. |
 | `ontology_create` | Create a new empty ontology. Parameters: `ontology_id` (letters, digits, `_`, `-`, `.`; not starting with `seed_`, reserved for seeds' Qdrant collections), `name`, optional `base_uri`. |
-| `ontology_switch` | Switch the active ontology for this session. All subsequent tools operate on the selected ontology. |
+| `ontology_switch` | Switch the active ontology for this session. All subsequent tools operate on the selected ontology, including the chunk processing status (tracked per ontology). |
 | `ontology_summary` | Counts of classes, properties, individuals, restrictions, root classes, and chunk processing progress. Includes `active_ontology`, the number of materialized inferences (`inferred_triples`) and the outcome of the last `ontology_check` since the server started (`last_check`: time, consistent, issues — later changes are not reflected until the next check). |
 | `ontology_export` | Export the active ontology as Turtle. Pass `include_seeds=true` to append all seed graphs. |
 | `ontology_orphans` | List classes/individuals with no relation to the rest of the graph beyond their own type/label/definition triples. |
@@ -146,10 +146,10 @@ enabled = true
 | Tool | Description |
 |------|-------------|
 | `chunk_collection_switch` | Switch the Qdrant collection the chunk tools read from, for this session only (default: `[qdrant].collection`). Optional `field_mapping` overrides the payload field names. Returns chunk counts. |
-| `chunk_list` | List chunks from Qdrant. Filter by `doc_id` and/or `status` (`pending`/`processed`/`all`). Returns `id`, `doc_id`, `chunk_index`, `text_preview` (200 chars), `status`. |
+| `chunk_list` | List chunks from Qdrant. Filter by `doc_id` and/or `status` (`pending`/`processed`/`all`). Returns `id`, `doc_id`, `chunk_index`, `text_preview` (200 chars), `status`. The status is the active ontology's. |
 | `chunk_read` | Read the full text of a chunk by its Qdrant point ID. |
 | `chunk_read_batch` | Read the full text of several chunks in one call. Returns `{id, doc_id, chunk_index, text, status}` for each. |
-| `chunk_mark_processed` | Mark a chunk as processed after extracting ontology elements from it. |
+| `chunk_mark_processed` | Mark a chunk as processed for the active ontology after extracting ontology elements from it. Other ontologies on the same collection are unaffected. |
 
 ### Concepts (`owl:Class`) and individuals
 
@@ -274,8 +274,9 @@ The label is `rdfs:label` or `skos:prefLabel` (English or untagged preferred, el
 Administrative operations not exposed to the MCP agent:
 
 ```bash
-# Delete an ontology: Oxigraph graph and Qdrant collection (does not affect seeds)
-olaf drop <ontology_id>
+# Delete an ontology: Oxigraph graph and Qdrant collection (does not affect seeds).
+# --collection also removes its status fields from that collection's chunks (repeatable).
+olaf drop <ontology_id> [--collection NAME ...]
 
 # Load a seed from a URL or a local file (Turtle, RDF/XML, N-Triples, N3, JSON-LD) into Oxigraph,
 # and index its classes, individuals and properties in Qdrant. --id of an existing seed replaces
@@ -293,8 +294,9 @@ olaf index-seed [seed_id ...]
 olaf drop-seed <seed_id>
 
 # Mark processed chunks as pending again (all, or one document's), to rebuild an ontology.
-# Removes only the olaf_status / olaf_processed_at payload fields.
-olaf reset-chunks [doc_id] [--collection NAME]
+# Removes only that ontology's olaf_status_{id} / olaf_processed_at_{id} payload fields
+# (default ontology: [ontology].ontology_id).
+olaf reset-chunks [doc_id] [--collection NAME] [--ontology ID]
 ```
 
 An unknown ontology or seed id is an error (exit code 1) for `drop`, `drop-seed`, `reindex` and `index-seed`; nothing is created or deleted. `drop` / `drop-seed` still remove a Qdrant collection left behind by an id whose graph is already gone.

@@ -76,7 +76,10 @@ async def _make_shared_infra(config: Config) -> tuple[OntologyStore, QdrantClien
     onto = OntologyStore(url=config.oxigraph.url)
     await onto.bootstrap(config.ontology.ontology_id, config.ontology.base_uri, config.ontology.name)
     qdrant = QdrantClient(url=config.qdrant.url, api_key=config.qdrant.api_key)
-    chunks = ChunkStore(config.qdrant.url, config.qdrant.collection, config.qdrant.field_mapping, config.qdrant.api_key)
+    chunks = ChunkStore(
+        config.qdrant.url, config.qdrant.collection, config.qdrant.field_mapping,
+        config.ontology.ontology_id, config.qdrant.api_key,
+    )
     return onto, qdrant, chunks
 
 
@@ -171,7 +174,8 @@ def create_server(
                 description=(
                     "List chunks from the Qdrant collection. "
                     "Filter by doc_id and/or status. Returns id, doc_id, chunk_index, "
-                    "text_preview (200 chars), and processing status."
+                    "text_preview (200 chars), and processing status. The status is the active "
+                    "ontology's: each ontology tracks its own progress on the same chunks."
                 ),
                 inputSchema={
                     "type": "object",
@@ -180,7 +184,7 @@ def create_server(
                         "status": {
                             "type": "string",
                             "enum": ["pending", "processed", "all"],
-                            "description": "Filter by olaf processing status (default: all)",
+                            "description": "Filter by the active ontology's processing status (default: all)",
                         },
                         "limit": {"type": "integer", "description": "Max results (default: 20)"},
                         "offset": {"type": "integer", "description": "Pagination offset"},
@@ -219,7 +223,10 @@ def create_server(
             ),
             types.Tool(
                 name="chunk_mark_processed",
-                description="Mark a chunk as processed after extracting ontology elements from it.",
+                description=(
+                    "Mark a chunk as processed for the active ontology after extracting ontology elements "
+                    "from it. Other ontologies built from the same collection are unaffected."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -789,7 +796,8 @@ def create_server(
                 name="ontology_switch",
                 description=(
                     "Switch the active ontology for this session. "
-                    "All subsequent tool calls will operate on the selected ontology."
+                    "All subsequent tool calls will operate on the selected ontology, including the chunk "
+                    "processing status, which each ontology tracks separately."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1230,6 +1238,7 @@ def create_server(
                     result = await onto.ontology_switch(arguments["ontology_id"])
                     session["ontology_id"] = result["active_id"]
                     session["base_uri"] = result["base_uri"]
+                    session["chunks"] = chunks.for_ontology(result["active_id"])
                     if embed:
                         embed.switch_collection(_ontology_collection(config, result['active_id']))
                     return _text(result)
@@ -1322,7 +1331,10 @@ def _make_sse_app(config: Config):
 
     onto = OntologyStore(url=config.oxigraph.url)
     qdrant = QdrantClient(url=config.qdrant.url, api_key=config.qdrant.api_key)
-    chunks = ChunkStore(config.qdrant.url, config.qdrant.collection, config.qdrant.field_mapping, config.qdrant.api_key)
+    chunks = ChunkStore(
+        config.qdrant.url, config.qdrant.collection, config.qdrant.field_mapping,
+        config.ontology.ontology_id, config.qdrant.api_key,
+    )
 
     @asynccontextmanager
     async def lifespan(app):
@@ -1384,9 +1396,19 @@ def _exit_unless_orphan(qdrant: QdrantClient, collection: str, error: ValueError
     sys.exit(1)
 
 
-def _cmd_drop(ontology_id: str) -> None:
+def _cmd_drop(argv: list[str]) -> None:
+    import argparse
+    parser = argparse.ArgumentParser(prog="olaf drop")
+    parser.add_argument("ontology_id")
+    parser.add_argument(
+        "--collection", action="append", default=[],
+        help="Also remove this ontology's status fields from the chunks of this Qdrant collection (repeatable)",
+    )
+    args = parser.parse_args(argv)
+    config = Config.load()
+    ontology_id = args.ontology_id
+
     async def _inner():
-        config = Config.load()
         onto = await _make_onto(config)
         qdrant = QdrantClient(url=config.qdrant.url, api_key=config.qdrant.api_key)
         collection = _ontology_collection(config, ontology_id)
@@ -1399,6 +1421,13 @@ def _cmd_drop(ontology_id: str) -> None:
             qdrant.delete_collection(collection)
         print(f"Ontologie '{ontology_id}' supprimée (graphe Oxigraph et collection Qdrant).")
     asyncio.run(_inner())
+
+    for collection in args.collection:
+        chunks = ChunkStore(
+            config.qdrant.url, collection, config.qdrant.field_mapping, ontology_id, config.qdrant.api_key,
+        )
+        count = chunks.reset_processed()
+        print(f"Statut retiré de {count} chunk(s) de la collection '{collection}'.")
 
 
 def _cmd_drop_seed(seed_id: str) -> None:
@@ -1526,24 +1555,23 @@ def _cmd_reset_chunks(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(prog="olaf reset-chunks")
     parser.add_argument("doc_id", nargs="?", help="Only reset this document's chunks")
     parser.add_argument("--collection", help="Qdrant collection (default: [qdrant].collection)")
+    parser.add_argument("--ontology", help="Ontology whose progress is reset (default: [ontology].ontology_id)")
     args = parser.parse_args(argv)
 
     config = Config.load()
     collection = args.collection or config.qdrant.collection
-    chunks = ChunkStore(config.qdrant.url, collection, config.qdrant.field_mapping, config.qdrant.api_key)
+    ontology_id = args.ontology or config.ontology.ontology_id
+    chunks = ChunkStore(config.qdrant.url, collection, config.qdrant.field_mapping, ontology_id, config.qdrant.api_key)
     count = chunks.reset_processed(args.doc_id)
     scope = f"du document '{args.doc_id}' " if args.doc_id else ""
-    print(f"{count} chunk(s) {scope}de la collection '{collection}' remis en attente.")
+    print(f"{count} chunk(s) {scope}de la collection '{collection}' remis en attente pour l'ontologie '{ontology_id}'.")
 
 
 def main() -> None:
     if len(sys.argv) >= 2:
         match sys.argv[1]:
             case "drop":
-                if len(sys.argv) < 3:
-                    print("Usage: olaf drop <ontology_id>", file=sys.stderr)
-                    sys.exit(1)
-                _cmd_drop(sys.argv[2])
+                _cmd_drop(sys.argv[2:])
             case "drop-seed":
                 if len(sys.argv) < 3:
                     print("Usage: olaf drop-seed <seed_id>", file=sys.stderr)
