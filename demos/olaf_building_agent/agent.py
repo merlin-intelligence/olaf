@@ -36,7 +36,7 @@ from prompts import BATCH_PROMPT, SYSTEM_PROMPT  # noqa: E402
 HIDDEN_TOOLS = {
     "ontology_create", "ontology_switch", "chunk_collection_switch",
     "chunk_list", "chunk_mark_processed", "ontology_export", "seed_load", "seed_select",
-    "ontology_check", "ontology_orphans", "ontology_infer", "entity_delete",
+    "ontology_check", "ontology_orphans", "ontology_infer", "entity_delete", "ontology_import",
 }
 
 # Searches that always cover the seeds selected for the run (unless none is selected).

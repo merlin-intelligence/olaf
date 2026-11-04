@@ -396,6 +396,7 @@ def create_server(
                 description=(
                     "Merge two concepts: all triples from merge_uri are copied to keep_uri, "
                     "all references to merge_uri are re-pointed to keep_uri, then merge_uri is deleted. "
+                    "Also merges two individuals, or two properties (their uses are re-pointed too). "
                     "merge_uri must be the ontology's own. keep_uri may be a reused seed term, to replace a "
                     "local duplicate of it: then only the references and source chunks are carried over, "
                     "since the seed term keeps its source definition."
@@ -805,6 +806,25 @@ def create_server(
                         "ontology_id": {"type": "string", "description": "Identifier of the ontology to activate"},
                     },
                     "required": ["ontology_id"],
+                },
+            ),
+            types.Tool(
+                name="ontology_import",
+                description=(
+                    "Copy another ontology into the active one, to merge them: all its triples, provenance "
+                    "included, its entities moved to the active ontology's namespace. An entity whose name the "
+                    "active ontology already uses is renamed with a _{source_id} suffix — never merged "
+                    "silently: `renamed` lists them, to review (concept_merge when they mean the same thing). "
+                    "Seed terms keep their URI. Returns the imported entities (uri, source_uri, kind, label, "
+                    "definition…) and re-indexes the active ontology for semantic search. The source "
+                    "ontology is unchanged. Importing the same ontology twice duplicates it."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "source_ontology_id": {"type": "string", "description": "Ontology to copy (see ontology_list)"},
+                    },
+                    "required": ["source_ontology_id"],
                 },
             ),
             types.Tool(
@@ -1241,6 +1261,16 @@ def create_server(
                     session["chunks"] = chunks.for_ontology(result["active_id"])
                     if embed:
                         embed.switch_collection(_ontology_collection(config, result['active_id']))
+                    return _text(result)
+
+                case "ontology_import":
+                    result = await onto.ontology_import(oid, arguments["source_ontology_id"])
+                    if embed:
+                        try:
+                            entities = await onto.ontology_entities(oid)
+                            await asyncio.to_thread(embed.index_collection, _ontology_collection(config, oid), entities)
+                        except Exception as e:
+                            result["warning"] = _index_failed(e)
                     return _text(result)
 
                 case "ontology_summary":
