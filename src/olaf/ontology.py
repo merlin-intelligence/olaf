@@ -441,11 +441,22 @@ class _HttpExecutor:
         if resp.is_error:
             raise ValueError(f"Oxigraph could not load the graph ({resp.status_code}): {resp.text.strip()}")
 
-    async def dump_graph(self, graph_uri: str) -> bytes:
+    async def append_graph(self, data: bytes, graph_uri: str, content_type: str = "text/turtle") -> None:
+        """Add triples to the graph, keeping its content."""
+        resp = await self._client.post(
+            f"{self._url}/store",
+            params={"graph": graph_uri},
+            content=data,
+            headers={"Content-Type": content_type},
+        )
+        if resp.is_error:
+            raise ValueError(f"Oxigraph could not add to the graph ({resp.status_code}): {resp.text.strip()}")
+
+    async def dump_graph(self, graph_uri: str, accept: str = "text/turtle") -> bytes:
         resp = await self._client.get(
             f"{self._url}/store",
             params={"graph": graph_uri},
-            headers={"Accept": "text/turtle"},
+            headers={"Accept": accept},
         )
         resp.raise_for_status()
         return resp.content
@@ -618,6 +629,86 @@ class OntologyStore:
         await self._ex.execute_update(f"DROP SILENT GRAPH <{graph}>")
         self._meta.pop(ontology_id, None)
         return {"dropped": ontology_id}
+
+    async def ontology_import(self, ontology_id: str, source_id: str) -> dict:
+        """Copy every triple of ontology `source_id` (provenance included) into `ontology_id`,
+        its entities moved to the target's namespace. An entity whose name the target already
+        uses gets a `_{source_id}` suffix instead: two ontologies built separately may use one
+        name for different things, so nothing is merged here — `renamed` lists those entities,
+        to review. Seed terms and other external URIs keep theirs (the same term in both).
+        Returns the imported entities as indexed for semantic search, under `entities`, each
+        with its `source_uri`. The source ontology is unchanged."""
+        if source_id == ontology_id:
+            raise ValueError("An ontology cannot be imported into itself.")
+        await self.require_ontology(source_id)
+        source_base = await self._resolve_base(source_id)
+        base = await self._resolve_base(ontology_id)
+        graph = self._graph(ontology_id)
+        prefix, target_prefix = source_base + "#", base + "#"
+
+        lines = [line for line in (await self._ex.dump_graph(self._graph(source_id), "application/n-triples"))
+                 .decode().splitlines() if line.strip()]
+        triples = []
+        for line in lines:
+            s, rest = line.split(" ", 1)
+            p, o = rest.split(" ", 1)
+            if s != f"<{source_base}>":  # the source's owl:Ontology declaration
+                triples.append([s, p, o.rstrip().removesuffix(".").rstrip()])
+
+        local = {t[1:-1] for triple in triples for t in triple if t.startswith(f"<{prefix}")}
+        rows = await self._ex.execute_select(f"""
+        SELECT DISTINCT ?x WHERE {{
+            GRAPH <{graph}> {{ {{ ?x ?p ?o }} UNION {{ ?s ?p ?x }} }}
+            FILTER(isIRI(?x) && STRSTARTS(STR(?x), "{target_prefix}"))
+        }}
+        """, ["x"])
+        taken = {r["x"] for r in rows}
+        uris: dict[str, str] = {}
+        clashes = []
+        for uri in sorted(local):
+            new = target_prefix + uri[len(prefix):]
+            if new in taken:
+                clashes.append(uri)
+            else:
+                uris[uri] = new
+                taken.add(new)
+        suffix = re.sub(r"[^A-Za-z0-9_]", "_", source_id)
+        for uri in clashes:
+            new, n = f"{target_prefix}{uri[len(prefix):]}_{suffix}", 2
+            while new in taken:
+                new, n = f"{target_prefix}{uri[len(prefix):]}_{suffix}{n}", n + 1
+            uris[uri] = new
+            taken.add(new)
+
+        # Blank nodes (restrictions) and provenance statements get identifiers of their own:
+        # those of the source would be shared with it, or with another ontology imported here.
+        bnode = f"_:i{uuid.uuid4().hex[:8]}"
+
+        def term(t: str) -> str:
+            if t.startswith("<urn:olaf:stmt:"):
+                key = f"{source_id}\n{t}"
+                return f"<urn:olaf:stmt:{hashlib.sha256(key.encode()).hexdigest()[:16]}>"
+            if t.startswith("<"):
+                return f"<{uris.get(t[1:-1], t[1:-1])}>"
+            if t.startswith("_:"):
+                return bnode + t[2:]
+            return t  # a literal
+
+        data = "".join(f"{term(s)} {term(p)} {term(o)} .\n" for s, p, o in triples)
+        if data:
+            await self._ex.append_graph(data.encode(), graph, "application/n-triples")
+
+        typed = {term(s)[1:-1] for s, p, _ in triples if p == "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>"
+                 and s.startswith("<")}
+        source_of = {new: old for old, new in uris.items()}
+        entities = [{**e, "source_uri": source_of.get(e["uri"], e["uri"])}
+                    for e in await self.ontology_entities(ontology_id, sorted(typed))] if typed else []
+        return {
+            "source": source_id,
+            "triples": len(triples),
+            "renamed": {old: uris[old] for old in clashes},
+            "entities": entities,
+        }
 
     async def seed_list(self) -> list[dict]:
         rows = await self._ex.execute_select(f"""

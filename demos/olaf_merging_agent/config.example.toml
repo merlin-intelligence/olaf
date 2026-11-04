@@ -1,0 +1,75 @@
+# olaf_merging_agent — example configuration
+# Copy to config.toml and fill in your values.
+
+[olaf]
+# URL of the running OLAF MCP server (SSE endpoint)
+url = "http://localhost:8000/sse"
+
+# Merged ontology, created by the run — it must not exist yet (olaf drop <id> to start over)
+ontology_id   = "merged"
+ontology_name = "Merged ontology"
+# base_uri = "http://example.org/merged#"   # namespace of the merged ontology (default: the server's)
+
+
+[merge]
+# The two ontologies to merge — they must exist, and are left unchanged.
+# The reference keeps its URIs: an entity of the other one judged equivalent is merged into it.
+reference = "gcf"
+other     = "ipcc"
+
+# Qdrant collections holding the chunks each ontology was built from: their text is given to the
+# LLM as evidence (optional — without it, the LLM judges from labels, definitions and parents)
+reference_collection = "gcf_chunks"
+other_collection     = "ipcc_chunks"
+
+
+[litellm]
+# Any model supported by LiteLLM — change the string to switch providers:
+#   Anthropic : "claude-sonnet-4-6"  → set ANTHROPIC_API_KEY
+#   OpenAI    : "gpt-4o"             → set OPENAI_API_KEY
+#   Ollama    : "ollama/llama3"       → no key needed, set OLLAMA_API_BASE if non-default
+#   Scaleway  : "openai/<model>"      → OpenAI-compatible: set api_base + api_key_env below
+model       = "claude-sonnet-4-6"
+max_tokens  = 4096
+temperature = 0
+
+# Seconds per LLM call before giving up. Raise this for reasoning models (e.g. ones that
+# "think" before answering) which can take a while to produce a large max_tokens response.
+timeout = 120
+
+# Retries when the provider answers 429 (rate limit / tokens-per-minute quota),
+# waiting 15s, 30s, then 60s between attempts.
+rate_limit_retries = 6
+
+# Retries when a call times out, cannot connect, or gets a 5xx error (10s pause each).
+transient_retries = 2
+
+# Optional — custom endpoint for OpenAI-compatible providers (Scaleway, vLLM…).
+# api_key_env is the NAME of the env var holding the key (the key itself stays out of the file).
+# api_base    = "https://api.scaleway.ai/v1"
+# api_key_env = "SCW_SECRET_KEY"
+
+
+[agent]
+# ── Matching ──
+# Needs embeddings on the server ([embedding] enabled = true).
+search_top_k          = 10    # semantic search results per entity (both ontologies' entities come back)
+min_score             = 0.7   # min similarity for a reference entity to be a candidate — too low, and
+                              # unrelated candidates get linked anyway (a country group under a fund)
+candidates_per_entity = 4     # candidates shown to the LLM per entity (same name first)
+entities_per_task     = 8     # entities of the other ontology judged per LLM call
+
+# ── Merging ──
+# Correspondences the LLM is at least this sure of are applied (merge, or subclass link);
+# the others are only written to the alignment file.
+min_confidence = 0.7
+
+# ── Context given with each task ──
+with_sources    = true   # include the source chunk text of the entities
+max_chunk_chars = 1200   # each chunk's text is cut beyond this
+
+# ── Output ──
+alignment_path = "alignment.sssom.tsv"   # the correspondences found, applied or not (empty = none)
+check          = true                    # run ontology_check on the merged ontology at the end
+# export_path  = "merged.ttl"            # Turtle export written at the end (optional)
+log_level      = "INFO"                  # DEBUG | INFO | WARNING

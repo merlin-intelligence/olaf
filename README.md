@@ -15,7 +15,7 @@ Text chunks (Qdrant)  ──►  LLM agent  ──►  OWL ontology (Oxigraph)
                               │  ▲
                          seeds│  │ concept_search / *_semantic_search
                               ▼  │
-                          40 MCP tools
+                          41 MCP tools
 ```
 
 **Storage split:**
@@ -135,6 +135,7 @@ enabled = true
 | `ontology_list` | List all ontologies in the store with id, name, base_uri, class count, and active flag. |
 | `ontology_create` | Create a new empty ontology. Parameters: `ontology_id` (letters, digits, `_`, `-`, `.`; not starting with `seed_`, reserved for seeds' Qdrant collections), `name`, optional `base_uri`. |
 | `ontology_switch` | Switch the active ontology for this session. All subsequent tools operate on the selected ontology, including the chunk processing status (tracked per ontology). |
+| `ontology_import` | Copy another ontology (`source_ontology_id`) into the active one, to merge them: all its triples, provenance included, its entities moved to the active ontology's namespace. An entity whose name the active ontology already uses gets a `_{source_id}` suffix instead of being merged silently — two ontologies built separately may use one name for different things: `renamed` lists them, to review. Seed terms keep their URI. Returns the imported entities (with their `source_uri`) and re-indexes the active ontology for semantic search. The source is unchanged. Used by [`olaf_merging_agent`](demos/olaf_merging_agent/). |
 | `ontology_summary` | Counts of classes, properties, individuals, restrictions, root classes, and chunk processing progress. Includes `active_ontology`, the number of materialized inferences (`inferred_triples`) and the outcome of the last `ontology_check` since the server started (`last_check`: time, consistent, issues — later changes are not reflected until the next check). |
 | `ontology_export` | Export the active ontology as Turtle. Pass `include_seeds=true` to append all seed graphs. |
 | `ontology_orphans` | List classes/individuals with no relation to the rest of the graph beyond their own type/label/definition triples. |
