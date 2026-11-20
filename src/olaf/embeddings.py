@@ -137,13 +137,13 @@ class EmbeddingService:
             return list(next(iter(model.embed([f"{prefix}{text}"]))).tolist())
         return model.encode(f"{prefix}{text}").tolist()
 
-    def _embed_many(self, texts: list[str]) -> list[list[float]]:
+    def _embed_many(self, texts: list[str], batch_size: int = 8) -> list[list[float]]:
         kind, model = self._model_instance()
         prefix = "passage: " if "e5" in self.model_name.lower() else ""
         texts = [f"{prefix}{t}" for t in texts]
         if kind == "fastembed":
-            return [v.tolist() for v in model.embed(texts)]
-        return [v.tolist() for v in model.encode(texts)]
+            return [v.tolist() for v in model.embed(texts, batch_size=batch_size)]
+        return [v.tolist() for v in model.encode(texts, batch_size=batch_size)]
 
     def _concept_point_id(self, uri: str) -> str:
         return str(uuid.uuid5(uuid.NAMESPACE_URL, uri))
@@ -176,7 +176,7 @@ class EmbeddingService:
                                 vector=self._embed(entity_text(entity)), payload=entity)],
         )
 
-    def index_collection(self, name: str, entities: list[dict], batch_size: int = 64) -> int:
+    def index_collection(self, name: str, entities: list[dict], batch_size: int = 8) -> int:
         """Make collection `name` hold exactly these entities (entries of OntologyStore.seed_entities /
         ontology_entities, kept as payload). Used to index a seed, or rebuild an ontology's index,
         as a whole. Points are replaced in place and stale ones removed at the end, so a failure
@@ -194,7 +194,7 @@ class EmbeddingService:
                 collection_name=name,
                 points=[
                     PointStruct(id=self._concept_point_id(e["uri"]), vector=vector, payload=e)
-                    for e, vector in zip(batch, self._embed_many(texts))
+                    for e, vector in zip(batch, self._embed_many(texts, batch_size=batch_size))
                 ],
             )
         keep = {self._concept_point_id(e["uri"]) for e in entities}
